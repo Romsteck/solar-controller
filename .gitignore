@@ -1,0 +1,20 @@
+# Rust
+/target/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Python
+**/__pycache__/
+*.pyc
+
+# Claude — settings locaux propres à chaque machine
+.claude/settings.local.json
+
+# OS / éditeurs
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
