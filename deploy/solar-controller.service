@@ -1,0 +1,22 @@
+[Unit]
+Description=Solar Controller
+After=network.target nut-server.service
+Wants=nut-server.service
+
+[Service]
+User=romain
+WorkingDirectory=/home/romain/solar-controller
+ExecStart=/home/romain/solar-controller/solar-controller
+# RestartSec=15 : laisser ≥10s aux bobines de relais pour se relâcher
+# complètement avant de redémarrer (évite tout chevauchement de fermeture
+# si le précédent process est mort en mode "relais fermé").
+Restart=on-failure
+RestartSec=15
+# SIGTERM laisse le temps au handler async de forcer open_all puis exit propre.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+ExecStopPost=/bin/sh -c 'logger -t solar-controller "service stopped (exit=$EXIT_STATUS, code=$EXIT_CODE)"'
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
