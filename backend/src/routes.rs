@@ -8,7 +8,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
-use crate::auto::MANUAL_OVERRIDE_DURATION;
 use crate::db::{log_relay_event, set_setting_bool};
 use crate::history::{fetch_history, Range};
 use crate::relay::RelayState;
@@ -33,8 +32,6 @@ pub struct StatusResponse {
     soc_percent: Option<f32>,
     float_reached_today: bool,
     eod_lockout: bool,
-    manual_override_active: bool,
-    manual_override_until: Option<chrono::DateTime<Utc>>,
 }
 
 /// Buffer live 5 min × 1 Hz, sérialisé orienté série pour minimiser les bytes.
@@ -65,12 +62,7 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     // si le mutex est tenu par `switch_to`, c'est qu'un switch est en cours.
     let switching = state.relay.try_lock().is_err();
     let db_connected = state.db.as_ref().map(|d| d.is_connected()).unwrap_or(false);
-    let now = Utc::now();
     let inner = state.inner.lock();
-    let manual_override_until = inner.auto.manual_override_until;
-    let manual_override_active = manual_override_until
-        .map(|t| now < t)
-        .unwrap_or(false);
     let (auto_reason, auto_message) = match &inner.auto.last_decision {
         Some(d) => (Some(d.reason.clone()), Some(d.message.clone())),
         None => (None, None),
@@ -87,8 +79,6 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         soc_percent: inner.auto.soc_percent,
         float_reached_today: inner.auto.float_reached_today,
         eod_lockout: inner.auto.eod_lockout,
-        manual_override_active,
-        manual_override_until,
     })
 }
 
@@ -111,12 +101,12 @@ pub async fn post_switch(State(state): State<AppState>) -> impl IntoResponse {
     let new_state = relay.current_state();
     let now = Utc::now();
     // Publier l'état (nouveau si succès, Open si erreur car switch_to force open_all sur erreur).
+    // `last_switch_at` arme l'anti-oscillation 10 min — c'est ce qui empêche
+    // l'auto de défaire le switch utilisateur immédiatement.
     {
         let mut inner = state.inner.lock();
         inner.published_state = new_state;
         inner.auto.last_switch_at = Some(now);
-        // Override manuel : la boucle auto ne décidera rien pendant 1h.
-        inner.auto.manual_override_until = Some(now + MANUAL_OVERRIDE_DURATION);
     }
 
     // Audit trail DB (best-effort).

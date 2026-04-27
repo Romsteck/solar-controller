@@ -43,10 +43,9 @@ const V_FLOAT_MIN_MINUTES: u32 = 10;
 const EOD_OFFSET: chrono::Duration = chrono::Duration::hours(2);
 
 /// Anti-oscillation : pas de switch auto si < 10 min depuis le dernier (sauf urgence).
+/// C'est aussi notre seul mécanisme pour respecter un switch manuel : l'auto
+/// ne pourra pas défaire la décision utilisateur pendant ces 10 min.
 const MIN_SWITCH_GAP: chrono::Duration = chrono::Duration::minutes(10);
-
-/// Durée du verrou manuel après un POST /api/switch utilisateur.
-pub const MANUAL_OVERRIDE_DURATION: chrono::Duration = chrono::Duration::hours(1);
 
 /// Période de la boucle de décision.
 const TICK: Duration = Duration::from_secs(60);
@@ -173,21 +172,9 @@ pub fn decide(auto: &AutoState, inputs: &DecisionInputs) -> Decision {
         };
     }
 
-    // Override manuel actif → on ne décide rien (sauf urgence ci-dessus).
-    if let Some(until) = auto.manual_override_until {
-        if inputs.now < until {
-            return Decision {
-                action: Action::Hold,
-                reason: "manual_override",
-                message: format!(
-                    "Override manuel actif jusqu'à {}",
-                    until.format("%H:%M")
-                ),
-            };
-        }
-    }
-
     // Anti-oscillation : pas de switch auto si dernier switch trop récent.
+    // C'est ce qui protège un switch manuel d'être défait dans la minute qui
+    // suit (chaque POST /api/switch met à jour `last_switch_at`).
     let recent_switch = auto
         .last_switch_at
         .map(|t| inputs.now.signed_duration_since(t) < MIN_SWITCH_GAP)
@@ -412,13 +399,6 @@ async fn tick_once(
             inner.auto.float_voltage_minutes = 0;
         }
 
-        // Override manuel expiré → nettoyage.
-        if let Some(until) = inner.auto.manual_override_until {
-            if now >= until {
-                inner.auto.manual_override_until = None;
-            }
-        }
-
         (
             inner.auto.clone(),
             inner.published_state,
@@ -619,16 +599,6 @@ mod tests {
         let d = decide(&auto, &inputs);
         assert_eq!(d.action, Action::Hold);
         assert_eq!(d.reason, "auto_disabled");
-    }
-
-    #[test]
-    fn manual_override_holds() {
-        let mut auto = AutoState::default();
-        auto.manual_override_until = Some(dt(13));
-        let inputs = base_inputs(Some(26.0), Some(26.0), RelayState::Grid);
-        let d = decide(&auto, &inputs);
-        assert_eq!(d.action, Action::Hold);
-        assert_eq!(d.reason, "manual_override");
     }
 
     #[test]

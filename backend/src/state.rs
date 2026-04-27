@@ -54,11 +54,9 @@ pub struct AutoState {
     /// Une fois passée la fenêtre EOD, on bloque toute reprise SOLAR jusqu'au
     /// prochain sunrise. Reset à chaque sunrise.
     pub eod_lockout: bool,
-    /// Tant que `now < manual_override_until`, la boucle auto ne décide rien
-    /// (sauf urgence). Posé par chaque POST /api/switch manuel.
-    pub manual_override_until: Option<DateTime<Utc>>,
     /// Timestamp du dernier switch (manuel OU auto OU watchdog). Utilisé pour
-    /// l'anti-oscillation MIN_SWITCH_GAP.
+    /// l'anti-oscillation MIN_SWITCH_GAP — c'est notre seul rempart contre une
+    /// reprise immédiate par l'auto après un switch manuel.
     pub last_switch_at: Option<DateTime<Utc>>,
     /// Dernière décision prise par la boucle auto (timestamp + raison sérialisée).
     /// Affichée dans l'UI.
@@ -79,7 +77,6 @@ impl Default for AutoState {
             soc_percent: None,
             float_reached_today: false,
             eod_lockout: false,
-            manual_override_until: None,
             last_switch_at: None,
             last_decision: None,
             low_voltage_minutes: 0,

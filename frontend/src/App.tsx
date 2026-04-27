@@ -10,7 +10,7 @@ import { UpsCard } from './components/UpsCard'
 import { HISTORY_CAPACITY, pushHistory } from './history'
 
 const SENSOR_LABELS: Record<number, string> = {
-  0x40: 'Batterie / Réseau',
+  0x40: 'Batterie',
   0x41: 'Solaire',
 }
 
@@ -151,9 +151,6 @@ export default function App() {
 
   const dbDown = status !== null && !status.db_connected
   const windowMinutes = Math.round(HISTORY_CAPACITY / 60)
-  const overrideUntilLabel = status?.manual_override_until
-    ? new Date(status.manual_override_until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : null
 
   return (
     <div className="app">
@@ -178,7 +175,6 @@ export default function App() {
               enabled={status.auto_enabled}
               reason={status.auto_reason}
               message={status.auto_message}
-              manualOverride={status.manual_override_active}
               pending={autoPending}
               onToggle={handleAutoToggle}
             />
@@ -197,11 +193,6 @@ export default function App() {
       {status && !status.auto_enabled && (
         <div className="alert alert--warn">
           Auto-switch désactivé — bascule manuelle uniquement. La règle de sécurité tension reste active.
-        </div>
-      )}
-      {status?.manual_override_active && overrideUntilLabel && (
-        <div className="alert alert--warn">
-          Override manuel actif jusqu'à {overrideUntilLabel} — l'auto-switch ne décide rien pendant ce temps.
         </div>
       )}
 
@@ -249,7 +240,7 @@ export default function App() {
 
             {historyData ? (
               <div className="history-grid">
-                <HistoryTile label="Tension réseau (0x40)" values={historyData.sensor_grid_v} />
+                <HistoryTile label="Tension batterie (0x40)" values={historyData.sensor_grid_v} />
                 <HistoryTile label="Tension solaire (0x41)" values={historyData.sensor_solar_v} accent="var(--solar)" />
                 <HistoryTile label="UPS — entrée" values={historyData.ups_input_v} accent="var(--accent)" />
                 <HistoryTile label="UPS — batterie" values={historyData.ups_battery_v} accent="var(--ok)" />

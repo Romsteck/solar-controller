@@ -30,8 +30,6 @@ export interface StatusResponse {
   soc_percent: number | null
   float_reached_today: boolean
   eod_lockout: boolean
-  manual_override_active: boolean
-  manual_override_until: string | null
 }
 
 export type Range = 'hour' | 'day' | 'week' | 'month'

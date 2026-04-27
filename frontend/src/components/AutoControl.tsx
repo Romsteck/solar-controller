@@ -4,7 +4,6 @@ interface Props {
   enabled: boolean
   reason: string | null
   message: string | null
-  manualOverride: boolean
   pending: boolean
   onToggle: (next: boolean) => void
 }
@@ -14,18 +13,15 @@ const REASON_TONE: Record<string, Tone> = {
   voltage_low_sustained: 'warn',
   eod_recharge: 'accent',
   voltage_recovered: 'ok',
-  manual_override: 'muted',
   auto_disabled: 'muted',
   anti_oscillation: 'muted',
   hold: 'muted',
 }
 
-export function AutoControl({ enabled, reason, message, manualOverride, pending, onToggle }: Props) {
-  const tone: Tone = manualOverride
-    ? 'muted'
-    : enabled
-      ? REASON_TONE[reason ?? 'hold'] ?? 'accent'
-      : 'muted'
+export function AutoControl({ enabled, reason, message, pending, onToggle }: Props) {
+  const tone: Tone = enabled
+    ? REASON_TONE[reason ?? 'hold'] ?? 'accent'
+    : 'muted'
 
   const label = enabled ? 'Auto ON' : 'Auto OFF'
   const action = enabled ? 'Désactiver' : 'Activer'
