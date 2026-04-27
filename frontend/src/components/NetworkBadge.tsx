@@ -1,34 +1,22 @@
 import type { RelayState } from '../api'
+import { StatusPill, type Tone } from './StatusPill'
 
 interface Props {
   state: RelayState
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  badge: {
-    display: 'inline-block',
-    padding: '0.4rem 1.2rem',
-    borderRadius: '999px',
-    fontWeight: 700,
-    fontSize: '1rem',
-    letterSpacing: '0.05em',
-    textTransform: 'uppercase',
-  },
-  grid: { background: '#1e40af', color: '#bfdbfe' },
-  solar: { background: '#166534', color: '#bbf7d0' },
-  open: { background: '#7f1d1d', color: '#fecaca' },
+const LABELS: Record<RelayState, string> = {
+  grid: 'Réseau',
+  solar: 'Solaire',
+  open: 'Sécurité',
 }
 
-const LABELS: Record<RelayState, string> = {
-  grid: 'Réseau GRID',
-  solar: 'Réseau Solaire',
-  open: 'Sécurité — tous relais ouverts',
+const TONES: Record<RelayState, Tone> = {
+  grid: 'grid',
+  solar: 'solar',
+  open: 'danger',
 }
 
 export function NetworkBadge({ state }: Props) {
-  return (
-    <span style={{ ...styles.badge, ...styles[state] }}>
-      {LABELS[state]}
-    </span>
-  )
+  return <StatusPill tone={TONES[state]}>{LABELS[state]}</StatusPill>
 }

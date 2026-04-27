@@ -1,30 +1,30 @@
 import { SensorReading } from '../api'
+import { Sparkline } from './Sparkline'
 
 interface Props {
   sensor: SensorReading
   label: string
+  voltageHistory: (number | null)[]
 }
 
-const card: React.CSSProperties = {
-  background: '#1e293b',
-  border: '1px solid #334155',
-  borderRadius: '0.75rem',
-  padding: '1rem 1.5rem',
-  minWidth: '160px',
-}
-
-const value: React.CSSProperties = {
-  fontSize: '1.5rem',
-  fontWeight: 700,
-  fontVariantNumeric: 'tabular-nums',
-}
-
-export function SensorCard({ sensor, label }: Props) {
+export function SensorCard({ sensor, label, voltageHistory }: Props) {
   return (
-    <div style={card}>
-      <div style={{ color: '#94a3b8', marginBottom: '0.5rem', fontSize: '0.85rem' }}>{label}</div>
-      <div style={value}>{sensor.bus_voltage_v.toFixed(2)} <span style={{ fontSize: '0.9rem', color: '#94a3b8' }}>V</span></div>
-      <div style={{ ...value, marginTop: '0.25rem' }}>{sensor.current_ma.toFixed(1)} <span style={{ fontSize: '0.9rem', color: '#94a3b8' }}>mA</span></div>
+    <div className="card">
+      <div className="card-header">
+        <span className="label">{label}</span>
+        <span className="dim" style={{ fontSize: '0.78rem', fontVariantNumeric: 'tabular-nums' }}>
+          0x{sensor.address.toString(16).padStart(2, '0')}
+        </span>
+      </div>
+
+      <div style={{ marginBottom: '0.85rem' }}>
+        <span className="metric-label">Tension</span>
+        <div className="metric-value" style={{ fontSize: '2rem', marginTop: '0.15rem' }}>
+          {sensor.bus_voltage_v.toFixed(2)}<span className="metric-unit">V</span>
+        </div>
+      </div>
+
+      <Sparkline values={voltageHistory} />
     </div>
   )
 }

@@ -4,19 +4,51 @@ import { NetworkBadge } from './components/NetworkBadge'
 import { SensorCard } from './components/SensorCard'
 import { SwitchButton } from './components/SwitchButton'
 import { UpsCard } from './components/UpsCard'
+import { HISTORY_CAPACITY, pushHistory } from './history'
 
 const SENSOR_LABELS: Record<number, string> = {
-  0x40: 'Capteur 0x40',
-  0x41: 'Capteur 0x41',
+  0x40: 'Batterie / Réseau',
+  0x41: 'Solaire',
+}
+
+interface History {
+  sensorVoltage: Record<number, (number | null)[]>
+  upsInputV: (number | null)[]
+  upsBattV: (number | null)[]
+}
+
+const EMPTY_HISTORY: History = {
+  sensorVoltage: {},
+  upsInputV: [],
+  upsBattV: [],
 }
 
 export default function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [error, setError] = useState(false)
   const [switchError, setSwitchError] = useState<string | null>(null)
+  const [history, setHistory] = useState<History>(EMPTY_HISTORY)
 
   useEffect(() => {
-    const tick = () => getStatus().then(s => { setStatus(s); setError(false) }).catch(() => setError(true))
+    const tick = () => {
+      getStatus()
+        .then(s => {
+          setStatus(s)
+          setError(false)
+          setHistory(prev => {
+            const sensorVoltage: Record<number, (number | null)[]> = { ...prev.sensorVoltage }
+            for (const sensor of s.sensors) {
+              sensorVoltage[sensor.address] = pushHistory(prev.sensorVoltage[sensor.address] ?? [], sensor.bus_voltage_v)
+            }
+            return {
+              sensorVoltage,
+              upsInputV: pushHistory(prev.upsInputV, s.ups?.input_voltage_v ?? null),
+              upsBattV: pushHistory(prev.upsBattV, s.ups?.battery_voltage_v ?? null),
+            }
+          })
+        })
+        .catch(() => setError(true))
+    }
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
@@ -32,61 +64,60 @@ export default function App() {
   }, [])
 
   return (
-    <div style={{ maxWidth: '480px', width: '100%' }}>
-      <h1 style={{ fontSize: '1.5rem', fontWeight: 700, marginBottom: '1.5rem', color: '#f1f5f9' }}>
-        Solar Controller
-      </h1>
-
-      {error && (
-        <div style={{ background: '#7f1d1d', color: '#fca5a5', padding: '0.75rem 1rem', borderRadius: '0.5rem', marginBottom: '1rem' }}>
-          Connexion perdue…
-        </div>
-      )}
-
-      {switchError && (
-        <div style={{ background: '#7f1d1d', color: '#fca5a5', padding: '0.75rem 1rem', borderRadius: '0.5rem', marginBottom: '1rem' }}>
-          {switchError}
-        </div>
-      )}
-
-      {status?.relay_state === 'open' && !status.switching && (
-        <div style={{ background: '#7f1d1d', color: '#fecaca', padding: '0.75rem 1rem', borderRadius: '0.5rem', marginBottom: '1rem', border: '2px solid #fca5a5' }}>
-          ⚠ État SÉCURITÉ : les deux relais sont ouverts. Aucune source active.
-        </div>
-      )}
-
-      {status ? (
-        <>
-          <div style={{ marginBottom: '1.5rem' }}>
-            <NetworkBadge state={status.relay_state} />
+    <div className="app">
+      <header className="app-header">
+        <div>
+          <h1 className="app-title">Solar Controller</h1>
+          <div className="app-subtitle">
+            Échantillon par seconde · fenêtre {HISTORY_CAPACITY}s
           </div>
-
-          <div style={{ marginBottom: '1.5rem' }}>
+        </div>
+        <div className="app-actions">
+          {status && <NetworkBadge state={status.relay_state} />}
+          {status && (
             <SwitchButton
               state={status.relay_state}
               switching={status.switching}
               onSwitch={handleSwitch}
             />
-          </div>
+          )}
+        </div>
+      </header>
 
-          <UpsCard ups={status.ups} />
+      {error && <div className="alert alert--danger">Connexion perdue…</div>}
+      {switchError && <div className="alert alert--danger">{switchError}</div>}
 
-          {status.sensors.length > 0 ? (
-            <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-              {status.sensors.map(s => (
+      {status?.relay_state === 'open' && !status.switching && (
+        <div className="alert alert--danger">
+          État SÉCURITÉ — les deux relais sont ouverts. Aucune source active.
+        </div>
+      )}
+
+      {status ? (
+        <>
+          <div className="grid grid-2" style={{ marginBottom: '1rem' }}>
+            {status.sensors.length > 0 ? (
+              status.sensors.map(s => (
                 <SensorCard
                   key={s.address}
                   sensor={s}
-                  label={SENSOR_LABELS[s.address] ?? `0x${s.address.toString(16)}`}
+                  label={SENSOR_LABELS[s.address] ?? `Capteur 0x${s.address.toString(16)}`}
+                  voltageHistory={history.sensorVoltage[s.address] ?? []}
                 />
-              ))}
-            </div>
-          ) : (
-            <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Aucune lecture capteur</p>
-          )}
+              ))
+            ) : (
+              <div className="card dim">Aucune lecture capteur</div>
+            )}
+          </div>
+
+          <UpsCard
+            ups={status.ups}
+            inputVoltageHistory={history.upsInputV}
+            batteryVoltageHistory={history.upsBattV}
+          />
         </>
       ) : (
-        <p style={{ color: '#64748b' }}>Connexion…</p>
+        <div className="card dim">Connexion…</div>
       )}
     </div>
   )

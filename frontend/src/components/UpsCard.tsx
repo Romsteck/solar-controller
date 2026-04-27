@@ -1,23 +1,12 @@
 import { UpsReading } from '../api'
+import { Bar } from './Bar'
+import { Sparkline } from './Sparkline'
+import { StatusPill, type Tone } from './StatusPill'
 
 interface Props {
   ups: UpsReading | null
-}
-
-const card: React.CSSProperties = {
-  background: '#1e293b',
-  border: '1px solid #334155',
-  borderRadius: '0.75rem',
-  padding: '1rem 1.5rem',
-  marginBottom: '1.5rem',
-}
-
-const grid: React.CSSProperties = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(2, 1fr)',
-  gap: '0.5rem 1rem',
-  fontVariantNumeric: 'tabular-nums',
-  fontSize: '0.95rem',
+  inputVoltageHistory: (number | null)[]
+  batteryVoltageHistory: (number | null)[]
 }
 
 const STALE_AFTER_S = 10
@@ -26,53 +15,113 @@ function fmt(v: number | null, unit: string, digits = 1): string {
   return v === null ? '—' : `${v.toFixed(digits)} ${unit}`
 }
 
-function statusLabel(s: string | null): string {
-  if (!s) return '—'
-  // Codes NUT standards : OL=on line, OB=on battery, LB=low battery, CHRG=charging, DISCHRG, RB=replace battery
-  const tokens = s.split(/\s+/)
-  const map: Record<string, string> = {
-    OL: 'Secteur',
-    OB: 'Batterie',
-    LB: 'Batterie faible',
-    CHRG: 'En charge',
-    DISCHRG: 'Décharge',
-    RB: 'Remplacer batt.',
-    BYPASS: 'Bypass',
-  }
-  return tokens.map(t => map[t] ?? t).join(' · ')
+interface StatusInfo {
+  label: string
+  tone: Tone
 }
 
-export function UpsCard({ ups }: Props) {
+function statusInfo(s: string | null): StatusInfo {
+  if (!s) return { label: '—', tone: 'muted' }
+  const tokens = s.split(/\s+/)
+  const map: Record<string, { label: string; tone: Tone }> = {
+    OL: { label: 'Secteur', tone: 'ok' },
+    OB: { label: 'Batterie', tone: 'warn' },
+    LB: { label: 'Batterie faible', tone: 'danger' },
+    CHRG: { label: 'En charge', tone: 'accent' },
+    DISCHRG: { label: 'Décharge', tone: 'warn' },
+    RB: { label: 'Remplacer batt.', tone: 'danger' },
+    BYPASS: { label: 'Bypass', tone: 'warn' },
+  }
+
+  let tone: Tone = 'muted'
+  const labels: string[] = []
+  for (const t of tokens) {
+    const entry = map[t]
+    if (entry) {
+      labels.push(entry.label)
+      // Le ton le plus alarmant l'emporte (danger > warn > accent > ok > muted).
+      const order: Tone[] = ['muted', 'ok', 'accent', 'warn', 'danger']
+      if (order.indexOf(entry.tone) > order.indexOf(tone)) tone = entry.tone
+    } else {
+      labels.push(t)
+    }
+  }
+  return { label: labels.join(' · '), tone }
+}
+
+function loadTone(load: number | null): 'accent' | 'warn' | 'danger' {
+  if (load === null) return 'accent'
+  if (load >= 90) return 'danger'
+  if (load >= 70) return 'warn'
+  return 'accent'
+}
+
+export function UpsCard({ ups, inputVoltageHistory, batteryVoltageHistory }: Props) {
   if (ups === null) {
     return (
-      <div style={{ ...card, color: '#64748b' }}>
-        <div style={{ color: '#94a3b8', marginBottom: '0.5rem', fontSize: '0.85rem' }}>UPS</div>
-        <div>UPS non détecté</div>
+      <div className="card">
+        <div className="card-header">
+          <span className="label">UPS</span>
+          <StatusPill tone="muted">Non détecté</StatusPill>
+        </div>
+        <div className="dim" style={{ fontSize: '0.85rem' }}>Aucune donnée NUT disponible.</div>
       </div>
     )
   }
 
   const ageS = Math.floor(Date.now() / 1000) - ups.last_seen
   const stale = ageS > STALE_AFTER_S
+  const status = statusInfo(ups.status)
 
   return (
-    <div style={{ ...card, opacity: stale ? 0.5 : 1 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '0.75rem' }}>
-        <span style={{ color: '#94a3b8', fontSize: '0.85rem' }}>UPS</span>
-        <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{statusLabel(ups.status)}</span>
+    <div className={`card${stale ? ' section-stale' : ''}`}>
+      <div className="card-header">
+        <span className="label">UPS</span>
+        <StatusPill tone={status.tone}>{status.label}</StatusPill>
       </div>
-      <div style={grid}>
-        <div><span style={{ color: '#94a3b8' }}>Entrée</span> {fmt(ups.input_voltage_v, 'V')}</div>
-        <div><span style={{ color: '#94a3b8' }}>Fréq</span> {fmt(ups.input_frequency_hz, 'Hz')}</div>
-        <div><span style={{ color: '#94a3b8' }}>Sortie</span> {fmt(ups.output_voltage_v, 'V')}</div>
-        <div><span style={{ color: '#94a3b8' }}>Charge</span> {fmt(ups.load_pct, '%', 0)}</div>
-        <div><span style={{ color: '#94a3b8' }}>Batt. V</span> {fmt(ups.battery_voltage_v, 'V', 2)}</div>
-        {ups.battery_pct !== null && (
-          <div><span style={{ color: '#94a3b8' }}>Batt. %</span> {fmt(ups.battery_pct, '%', 0)}</div>
-        )}
+
+      <div className="metric-row">
+        <div className="metric">
+          <span className="metric-label">Entrée</span>
+          <span className="metric-value">{fmt(ups.input_voltage_v, 'V')}</span>
+        </div>
+        <div className="metric">
+          <span className="metric-label">Sortie</span>
+          <span className="metric-value">{fmt(ups.output_voltage_v, 'V')}</span>
+        </div>
+        <div className="metric">
+          <span className="metric-label">Fréq.</span>
+          <span className="metric-value">{fmt(ups.input_frequency_hz, 'Hz')}</span>
+        </div>
       </div>
+
+      <div style={{ marginBottom: '0.85rem' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.35rem' }}>
+          <span className="metric-label">Charge UPS</span>
+          <span className="dim" style={{ fontSize: '0.8rem', fontVariantNumeric: 'tabular-nums' }}>
+            {fmt(ups.load_pct, '%', 0)}
+          </span>
+        </div>
+        <Bar value={ups.load_pct} tone={loadTone(ups.load_pct)} />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+        <div>
+          <div className="metric-label" style={{ marginBottom: '0.25rem' }}>
+            Entrée — {fmt(ups.input_voltage_v, 'V')}
+          </div>
+          <Sparkline values={inputVoltageHistory} />
+        </div>
+        <div>
+          <div className="metric-label" style={{ marginBottom: '0.25rem' }}>
+            Batterie — {fmt(ups.battery_voltage_v, 'V', 2)}
+          </div>
+          <Sparkline values={batteryVoltageHistory} accent="var(--ok)" />
+        </div>
+      </div>
+
       {stale && (
-        <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#fbbf24' }}>
+        <div className="alert alert--warn" style={{ marginTop: '0.75rem', marginBottom: 0 }}>
           Données obsolètes ({ageS}s)
         </div>
       )}
