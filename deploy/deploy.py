@@ -75,8 +75,14 @@ def main():
 
     # 2. Cross-compile backend via WSL (gcc-aarch64-linux-gnu + cargo dans WSL)
     wsl_path = PROJECT_ROOT.as_posix().replace("s:/", "/mnt/s/").replace("S:/", "/mnt/s/")
+    # Target musl pour binaire 100% statique : indépendant de la glibc de la Pi
+    # (Bookworm = 2.36) et du compilateur de la machine de build (Noble = 2.39).
+    # Cross-compiler musl à installer une fois dans WSL via :
+    #   wget https://musl.cc/aarch64-linux-musl-cross.tgz && tar -xzf ... -C $HOME
+    # Le PATH est ajouté ici pour que ring/cc-rs trouve aarch64-linux-musl-gcc.
     run(
-        f'wsl bash -c "source ~/.cargo/env && cd {wsl_path}/backend && '
+        f'wsl bash -c "PATH=\\$HOME/aarch64-linux-musl-cross/bin:\\$PATH && '
+        f'source ~/.cargo/env && cd {wsl_path}/backend && '
         f'cargo build --release --target aarch64-unknown-linux-musl"'
     )
 

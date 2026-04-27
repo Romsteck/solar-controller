@@ -18,6 +18,7 @@ Builds and deploys are driven from Windows; the cross-compile happens inside WSL
 - **Frontend dev server**: `cd frontend && npm run dev`. Vite proxies `/api` to `http://10.0.0.103:3000`, so the dev UI talks to the live Pi.
 - **Frontend production build**: `cd frontend && npm run build` (runs `tsc` then `vite build` into `frontend/dist/`).
 - **Service inspection on the Pi**: `ssh romain@10.0.0.103 'sudo systemctl status solar-controller --no-pager -l'` and `journalctl -u solar-controller -n 100`.
+- **DB connectivity test from the Pi**: `ssh romain@10.0.0.103 "PGPASSWORD=azerty psql -h 10.0.0.20 -U romain -d solar_data -c '\\dt'"` should list `sensor_samples`, `ups_samples`, `weather_samples`, `relay_events`. Requires `postgresql-client` on the Pi (already installed).
 
 ## Backend architecture (`backend/src/`)
 
@@ -39,8 +40,24 @@ Single Axum binary, three concurrent loops + HTTP server, all sharing `AppState`
 **Watchdog** ([watchdog.rs](backend/src/watchdog.rs)): every 500 ms, `try_lock` on the relay mutex (so it never blocks an in-flight switch); on success calls `verify()` which re-reads GPIO. If physical state diverges from logical state, it forces `open_all()` and republishes.
 
 **Routes** ([routes.rs](backend/src/routes.rs)):
-- `GET /api/status` — uses `try_lock` on the relay mutex purely as a "switch in progress" probe, then reads from `inner`. Never blocks.
+- `GET /api/status` — uses `try_lock` on the relay mutex purely as a "switch in progress" probe, then reads from `inner`. Never blocks. Includes `db_connected: bool` for UI observability.
 - `POST /api/switch` — `try_lock` returns 409 if a switch is already in flight (avoids queueing clicks). Toggles via `current_state().next_target()`. Always republishes `current_state()` after, even on error (`switch_to` left it as `Open`).
+- `GET /api/history?range=hour|day|week|month` — returns aggregated time-series for sensors, UPS, weather. Aggregation is done by PostgreSQL via `date_bin` + `LEFT JOIN` on a generated axis (see [history.rs](backend/src/history.rs)); the Pi only receives the bucketed result. Returns 503 if DB is unreachable. Response is gzip-compressed via `tower_http::CompressionLayer`.
+
+**Boot sequence (LOAD-BEARING, see [main.rs](backend/src/main.rs))**: the order is critical for safety. NEVER move a network `await` (DB connect, HTTP fetch, DNS) before step 2.
+1. Init GPIO → pins HIGH = relays open.
+2. **`switch_to(Grid, 500ms)` BEFORE any other init.** If a later step (DB, weather) hangs on a network timeout, the load is already on grid power and not draining the UPS battery.
+3. Init DB via `db::connect_with_retry` (3 attempts × 5 s, max ~21 s). If DB unreachable, `app_state.db = None` and the service runs in degraded mode (no recorder, no weather, `/api/history` → 503). The live `/api/status` and `/api/switch` are unaffected.
+4. Spawn loops: sensors / UPS / watchdog (always); recorder / weather / health-check (only if DB connected).
+5. Spawn shutdown handler (forces `open_all()` on SIGTERM).
+6. Bind HTTP and serve.
+
+**Persistence layer** ([db.rs](backend/src/db.rs), [recorder.rs](backend/src/recorder.rs), [weather.rs](backend/src/weather.rs), [history.rs](backend/src/history.rs)):
+- `db.rs` exposes `Db { pool, connected: Arc<AtomicBool> }`. `health_loop` pings every 60 s and updates the atomic; transitions are logged once (no spam). The atomic is read by `/api/status` for `db_connected`.
+- `recorder.rs` snapshots `InnerState` every 10 s and INSERTs sensors + UPS in batched multi-row VALUES. Errors → warn log, loop continues.
+- `weather.rs` polls Open-Meteo every 15 min for `temperature_2m`, `cloud_cover`, `shortwave_radiation` (Bruxelles default lat/lon, configurable via env). Stored in `weather_samples`. `shortwave_radiation` is the strongest predictor for solar production correlation.
+- `history.rs` runs a single CTE-based query on the DB server (10.0.0.20), aggregating with `date_bin`. The Pi never holds raw samples in memory.
+- Schema in [backend/migrations/001_init.sql](backend/migrations/001_init.sql) — 4 tables, idempotent (`CREATE TABLE IF NOT EXISTS`), executed at every boot.
 
 **Sensor poll** ([sensors.rs](backend/src/sensors.rs)): every 1 s, reads two I²C devices at `0x40` and `0x41`. **These are INA236 (Joy-it SBC-DVA), not INA219/INA226** despite common labeling — bus voltage is 1.6 mV/LSB (cast `i16 → u16 → f32`), shunt is 8 mΩ on PCB so current is `shunt_raw × 0.3125 mA`. Don't "fix" the formula to a generic INA219 one.
 
@@ -50,15 +67,21 @@ Single Axum binary, three concurrent loops + HTTP server, all sharing `AppState`
 
 ## Frontend architecture (`frontend/src/`)
 
-React 18 + Vite, intentionally tiny: [App.tsx](frontend/src/App.tsx) polls `/api/status` every 1 s, displays `NetworkBadge`/`SwitchButton`/`UpsCard`/`SensorCard`, and POSTs to `/api/switch`. `relay_state === 'open'` is treated as the "safety" state and surfaces a red banner — the UI is the user-visible signal that something has tripped. No state library, no router. Inline styles throughout.
+React 18 + Vite, intentionally tiny. Two independent polling loops in [App.tsx](frontend/src/App.tsx):
+- **Live status** every 30 s via `getStatus()` — drives `NetworkBadge`, `SwitchButton`, latest sensor/UPS values.
+- **Historical data** via `getHistory(range)` — fetched on mount and refreshed every 60 s. Backend already aggregates per range, so sparklines are pre-filled at first paint (no warm-up time).
+
+`<RangeSelector>` toggles between `hour | day | week | month` (1 min / 5 min / 1 h / 6 h buckets respectively); changing range re-fetches. Sparklines accept `(number | null)[]` and render gaps for missing buckets, so weather samples (15 min cadence) display correctly under finer ranges.
+
+`relay_state === 'open'` surfaces a red safety banner. `db_connected === false` surfaces a discrete warn banner ("history unavailable"); the live state and switch button keep working. No state library, no router, no chart library — `Sparkline` is hand-rolled SVG.
 
 ## Build & cross-compile setup
 
 - Workspace root `Cargo.toml` declares `members = ["backend"]`.
 - Release profile is size-optimized: `opt-level = "z"`, `lto = true`, `strip = true`.
 - [.cargo/config.toml](.cargo/config.toml) wires both ARM64 targets:
-  - `aarch64-unknown-linux-gnu` → `aarch64-linux-gnu-gcc` linker (used for local `cargo check`).
-  - `aarch64-unknown-linux-musl` → `rust-lld` with `+crt-static` (this is what `deploy.py` ships, so the binary doesn't depend on the Pi's glibc).
+  - `aarch64-unknown-linux-gnu` → `aarch64-linux-gnu-gcc` linker (used for local `cargo check`). NOT used by deploy — building on Ubuntu Noble (glibc 2.39) produces a binary that won't run on the Pi (glibc 2.36, Bookworm).
+  - `aarch64-unknown-linux-musl` → `rust-lld` with `+crt-static`. **This is what `deploy.py` ships** — fully static binary, glibc-independent. Requires the `aarch64-linux-musl-gcc` cross-compiler (needed by `ring`/`cc-rs`) which isn't in Ubuntu's apt repos. Install once: `wget https://musl.cc/aarch64-linux-musl-cross.tgz && tar -xzf ... -C $HOME`. `deploy.py` prepends `~/aarch64-linux-musl-cross/bin` to PATH at build time.
 - Deploy script lives outside the Cargo workspace and uses `paramiko` for SFTP/SSH (no shelling out to `scp`/`ssh`).
 
 ## Hardware constraints worth knowing before you touch code
@@ -66,3 +89,12 @@ React 18 + Vite, intentionally tiny: [App.tsx](frontend/src/App.tsx) polls `/api
 - Relay pins: **GPIO 20 = grid, GPIO 26 = solar**. Active-LOW HAT.
 - I²C addresses: `0x40` (battery/grid side, ~25 V in nominal Grid mode), `0x41` (solar side, reads ~0 V when Grid is active).
 - UPS over USB through NUT in standalone mode (`nut-server` listening on `127.0.0.1:3493`, UPS named `ups`). The systemd unit declares `After=nut-server.service` / `Wants=nut-server.service`.
+
+## Operational context
+
+- **Production deployment**: the Pi runs in production with an active load on the output. Acceptable downtime during a service restart: **5 min max** — the UPS covers the load during that window. Beyond that, battery drain risk. Prefer clean `systemctl restart` over hot-reload tricks.
+- **Required environment variables** (set in [deploy/solar-controller.service](deploy/solar-controller.service)):
+  - `DATABASE_URL=postgres://romain:azerty@10.0.0.20/solar_data` — PostgreSQL host (separate machine, so disk/CPU not Pi-limiting).
+  - `WEATHER_LAT`, `WEATHER_LON` — Open-Meteo coordinates. Default Bruxelles (50.85, 4.35); adjust to actual Pi location for relevant solar radiation data.
+  The service tolerates missing env vars: it boots in degraded mode (no persistence, no weather) but `/api/status` and `/api/switch` keep working.
+- **External DB**: 10.0.0.20 runs PostgreSQL 18. The Pi has `postgresql-client` installed for ad-hoc inspection. Schema is created idempotently at every boot — to wipe, `TRUNCATE sensor_samples, ups_samples, weather_samples, relay_events;` from any psql.

@@ -1,12 +1,17 @@
+mod db;
+mod history;
+mod recorder;
 mod relay;
 mod routes;
 mod sensors;
 mod state;
 mod ups;
 mod watchdog;
+mod weather;
 
 use std::time::Duration;
 use axum::{routing::{get, post}, Router};
+use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 use crate::state::Network;
 
@@ -48,6 +53,9 @@ async fn main() {
         default_hook(info);
     }));
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 1 : init GPIO. Les pins partent en HIGH = relais ouverts (sûr).
+    // ═══════════════════════════════════════════════════════════════════════
     let relay = match relay::RelayController::new() {
         Ok(r) => r,
         Err(e) => {
@@ -55,11 +63,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let app_state = state::AppState::new(relay);
+    let mut app_state = state::AppState::new(relay);
 
-    // Boot en mode nominal : après l'init où les deux pins sont HIGH (relais
-    // ouverts), on entre en mode Grid via la même API sécurisée que le runtime.
-    // Si l'opération échoue, on reste en RelayState::Open — état sûr.
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 2 (LOAD-BEARING) : basculer en Grid AVANT toute init réseau.
+    // Ne JAMAIS introduire un await réseau (DB connect, HTTP fetch, DNS) avant
+    // ce bloc — sinon un timeout réseau au boot laisserait l'UPS sur batterie.
+    // Si le switch initial échoue, on reste relais ouverts (état sûr).
+    // ═══════════════════════════════════════════════════════════════════════
     {
         let mut relay = app_state.relay.lock().await;
         match relay.switch_to(Network::Grid, Duration::from_millis(500)).await {
@@ -73,12 +84,54 @@ async fn main() {
         app_state.inner.lock().published_state = new_state;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 3 : init DB (avec retry borné, ~21s max). Le relais est déjà
+    // sécurisé en Grid, donc un timeout DB ici n'a pas d'impact sur la charge.
+    // Si la DB est injoignable, on passe en mode dégradé (pas de recorder, pas
+    // de météo, /api/history → 503). Le live /api/status fonctionne toujours.
+    // ═══════════════════════════════════════════════════════════════════════
+    let database_url = std::env::var("DATABASE_URL").ok();
+    let db = match database_url {
+        Some(url) => db::connect_with_retry(&url).await,
+        None => {
+            tracing::warn!("DATABASE_URL non définie — mode dégradé (pas de persistance)");
+            None
+        }
+    };
+    app_state.db = db.clone();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 4 : spawn des loops. Sensors/UPS/watchdog tournent toujours.
+    // Recorder/weather/health-check uniquement si DB OK.
+    // ═══════════════════════════════════════════════════════════════════════
     tokio::spawn(sensors::poll_loop(app_state.clone()));
     tokio::spawn(ups::poll_loop(app_state.clone()));
     tokio::spawn(watchdog::run(app_state.clone()));
 
-    // Handler de signal pour un graceful shutdown. À la réception de
-    // SIGTERM/SIGINT, on force open_all avant de quitter.
+    if let Some(d) = db.clone() {
+        tokio::spawn(recorder::record_loop(app_state.clone(), d));
+    }
+    if let Some(d) = db.clone() {
+        let lat = std::env::var("WEATHER_LAT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        let lon = std::env::var("WEATHER_LON")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        match (lat, lon) {
+            (Some(la), Some(lo)) => {
+                tokio::spawn(weather::weather_loop(d, la, lo));
+            }
+            _ => tracing::warn!("WEATHER_LAT/WEATHER_LON manquants — météo désactivée"),
+        }
+    }
+    if let Some(d) = db.clone() {
+        tokio::spawn(db::health_loop(d));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 5 : signal handler pour graceful shutdown.
+    // ═══════════════════════════════════════════════════════════════════════
     let shutdown_state = app_state.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -98,9 +151,17 @@ async fn main() {
         std::process::exit(0);
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ÉTAPE 6 : serve HTTP.
+    // Compression gzip uniquement sur les routes API (pas sur les assets
+    // statiques pré-compressés par Vite).
+    // ═══════════════════════════════════════════════════════════════════════
     let app = Router::new()
         .route("/api/status", get(routes::get_status))
         .route("/api/switch", post(routes::post_switch))
+        .route("/api/history", get(routes::get_history))
+        .route("/api/live-history", get(routes::get_live_history))
+        .layer(CompressionLayer::new())
         .fallback_service(ServeDir::new("frontend/dist"))
         .with_state(app_state);
 

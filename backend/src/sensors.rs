@@ -39,9 +39,18 @@ pub async fn poll_loop(state: AppState) {
                 .filter_map(|&addr| read_sensor(&mut i2c, addr).ok())
                 .collect();
             if !readings.is_empty() {
+                let now = chrono::Utc::now().timestamp();
                 // parking_lot::Mutex : `lock()` ne peut pas s'empoisonner et
                 // ne retourne pas de Result, donc plus aucun `unwrap` ici.
-                state.inner.lock().sensors = readings;
+                let mut inner = state.inner.lock();
+                inner.sensors = readings.clone();
+                // Snapshot 1 Hz aligné dans le buffer live. La cadence sensors
+                // (1 s) est notre horloge directrice ; on capture la dernière
+                // valeur UPS connue (celle-ci se rafraîchit à 2 s, ce qui peut
+                // entraîner une répétition pour deux samples consécutifs — sans
+                // impact pour la visualisation).
+                let ups_snapshot = inner.ups.clone();
+                inner.live.push(now, &readings, ups_snapshot.as_ref());
             }
         }
     }

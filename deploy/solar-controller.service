@@ -1,7 +1,7 @@
 [Unit]
 Description=Solar Controller
-After=network.target nut-server.service
-Wants=nut-server.service
+After=network-online.target nut-server.service
+Wants=network-online.target nut-server.service
 
 [Service]
 User=romain
@@ -17,6 +17,13 @@ KillSignal=SIGTERM
 TimeoutStopSec=5
 ExecStopPost=/bin/sh -c 'logger -t solar-controller "service stopped (exit=$EXIT_STATUS, code=$EXIT_CODE)"'
 Environment=RUST_LOG=info
+# DB : 10.0.0.20, user romain, db solar_data. Si absente, le service tourne en
+# mode dégradé (pas de persistance ni d'history, /api/status reste fonctionnel).
+Environment=DATABASE_URL=postgres://romain:azerty@10.0.0.20/solar_data
+# Coordonnées approximatives (Bruxelles) pour Open-Meteo. À adapter à
+# l'emplacement réel de la Pi pour des données pertinentes (radiation solaire).
+Environment=WEATHER_LAT=50.85
+Environment=WEATHER_LON=4.35
 
 [Install]
 WantedBy=multi-user.target

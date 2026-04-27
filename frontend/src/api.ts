@@ -23,6 +23,24 @@ export interface StatusResponse {
   switching: boolean
   sensors: SensorReading[]
   ups: UpsReading | null
+  db_connected: boolean
+}
+
+export type Range = 'hour' | 'day' | 'week' | 'month'
+
+export interface HistoryPayload {
+  range: Range
+  bucket: string
+  ts: number[]
+  sensor_grid_v: (number | null)[]
+  sensor_grid_ma: (number | null)[]
+  sensor_solar_v: (number | null)[]
+  sensor_solar_ma: (number | null)[]
+  ups_input_v: (number | null)[]
+  ups_battery_v: (number | null)[]
+  weather_temp_c: (number | null)[]
+  weather_cloud_pct: (number | null)[]
+  weather_radiation: (number | null)[]
 }
 
 export async function getStatus(): Promise<StatusResponse> {
@@ -33,4 +51,25 @@ export async function getStatus(): Promise<StatusResponse> {
 
 export async function postSwitch(): Promise<Response> {
   return fetch('/api/switch', { method: 'POST' })
+}
+
+export async function getHistory(range: Range): Promise<HistoryPayload> {
+  const r = await fetch(`/api/history?range=${range}`)
+  if (!r.ok) throw new Error(`history fetch failed: ${r.status}`)
+  return r.json()
+}
+
+export interface LiveHistoryResponse {
+  capacity: number
+  ts: number[]
+  sensor_grid_v: (number | null)[]
+  sensor_solar_v: (number | null)[]
+  ups_input_v: (number | null)[]
+  ups_battery_v: (number | null)[]
+}
+
+export async function getLiveHistory(): Promise<LiveHistoryResponse> {
+  const r = await fetch('/api/live-history')
+  if (!r.ok) throw new Error(`live-history fetch failed: ${r.status}`)
+  return r.json()
 }
