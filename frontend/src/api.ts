@@ -24,6 +24,14 @@ export interface StatusResponse {
   sensors: SensorReading[]
   ups: UpsReading | null
   db_connected: boolean
+  auto_enabled: boolean
+  auto_reason: string | null
+  auto_message: string | null
+  soc_percent: number | null
+  float_reached_today: boolean
+  eod_lockout: boolean
+  manual_override_active: boolean
+  manual_override_until: string | null
 }
 
 export type Range = 'hour' | 'day' | 'week' | 'month'
@@ -51,6 +59,14 @@ export async function getStatus(): Promise<StatusResponse> {
 
 export async function postSwitch(): Promise<Response> {
   return fetch('/api/switch', { method: 'POST' })
+}
+
+export async function postAutoToggle(enabled: boolean): Promise<Response> {
+  return fetch('/api/auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
 }
 
 export async function getHistory(range: Range): Promise<HistoryPayload> {

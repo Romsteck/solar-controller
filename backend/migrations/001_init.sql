@@ -36,3 +36,25 @@ CREATE TABLE IF NOT EXISTS relay_events (
     ts    TIMESTAMPTZ PRIMARY KEY,
     state TEXT NOT NULL
 );
+ALTER TABLE relay_events ADD COLUMN IF NOT EXISTS reason TEXT;
+
+-- Persistance des paramètres modifiables à chaud (auto-switch on/off, etc.).
+-- Utilisé via db::get_setting_bool / set_setting_bool.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Prévisions journalières (lever/coucher + somme rayonnement) pour la
+-- décision auto fin-de-journée. Stocke 2-3 jours glissants.
+-- shortwave_sum_kwh : somme du rayonnement journalier en kWh/m²
+-- (Open-Meteo renvoie shortwave_radiation_sum en MJ/m² → divisé par 3.6).
+CREATE TABLE IF NOT EXISTS forecast_daily (
+    date              DATE PRIMARY KEY,
+    sunrise           TIMESTAMPTZ,
+    sunset            TIMESTAMPTZ,
+    shortwave_sum_kwh REAL,
+    fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_forecast_daily_date ON forecast_daily (date DESC);

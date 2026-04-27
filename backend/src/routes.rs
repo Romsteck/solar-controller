@@ -4,9 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
+use crate::auto::MANUAL_OVERRIDE_DURATION;
+use crate::db::{log_relay_event, set_setting_bool};
 use crate::history::{fetch_history, Range};
 use crate::relay::RelayState;
 use crate::state::AppState;
@@ -24,6 +27,14 @@ pub struct StatusResponse {
     sensors: Vec<crate::state::SensorReading>,
     ups: Option<crate::state::UpsReading>,
     db_connected: bool,
+    auto_enabled: bool,
+    auto_reason: Option<String>,
+    auto_message: Option<String>,
+    soc_percent: Option<f32>,
+    float_reached_today: bool,
+    eod_lockout: bool,
+    manual_override_active: bool,
+    manual_override_until: Option<chrono::DateTime<Utc>>,
 }
 
 /// Buffer live 5 min × 1 Hz, sérialisé orienté série pour minimiser les bytes.
@@ -54,13 +65,30 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     // si le mutex est tenu par `switch_to`, c'est qu'un switch est en cours.
     let switching = state.relay.try_lock().is_err();
     let db_connected = state.db.as_ref().map(|d| d.is_connected()).unwrap_or(false);
+    let now = Utc::now();
     let inner = state.inner.lock();
+    let manual_override_until = inner.auto.manual_override_until;
+    let manual_override_active = manual_override_until
+        .map(|t| now < t)
+        .unwrap_or(false);
+    let (auto_reason, auto_message) = match &inner.auto.last_decision {
+        Some(d) => (Some(d.reason.clone()), Some(d.message.clone())),
+        None => (None, None),
+    };
     Json(StatusResponse {
         relay_state: inner.published_state,
         switching,
         sensors: inner.sensors.clone(),
         ups: inner.ups.clone(),
         db_connected,
+        auto_enabled: inner.auto.enabled,
+        auto_reason,
+        auto_message,
+        soc_percent: inner.auto.soc_percent,
+        float_reached_today: inner.auto.float_reached_today,
+        eod_lockout: inner.auto.eod_lockout,
+        manual_override_active,
+        manual_override_until,
     })
 }
 
@@ -81,8 +109,34 @@ pub async fn post_switch(State(state): State<AppState>) -> impl IntoResponse {
 
     let result = relay.switch_to(target, SWITCH_UX_DELAY).await;
     let new_state = relay.current_state();
+    let now = Utc::now();
     // Publier l'état (nouveau si succès, Open si erreur car switch_to force open_all sur erreur).
-    state.inner.lock().published_state = new_state;
+    {
+        let mut inner = state.inner.lock();
+        inner.published_state = new_state;
+        inner.auto.last_switch_at = Some(now);
+        // Override manuel : la boucle auto ne décidera rien pendant 1h.
+        inner.auto.manual_override_until = Some(now + MANUAL_OVERRIDE_DURATION);
+    }
+
+    // Audit trail DB (best-effort).
+    if let Some(db) = state.db.as_ref() {
+        if db.is_connected() {
+            let state_str = match new_state {
+                RelayState::Open => "open",
+                RelayState::Grid => "grid",
+                RelayState::Solar => "solar",
+            };
+            let reason_str = if result.is_ok() {
+                "manual"
+            } else {
+                "manual_failed"
+            };
+            if let Err(e) = log_relay_event(db, now, state_str, reason_str).await {
+                tracing::warn!(error = %e, "log_relay_event échoué");
+            }
+        }
+    }
 
     match result {
         Ok(()) => {
@@ -94,6 +148,56 @@ pub async fn post_switch(State(state): State<AppState>) -> impl IntoResponse {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
         }
     }
+}
+
+#[derive(Deserialize)]
+pub struct AutoToggleBody {
+    enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct AutoToggleResponse {
+    auto_enabled: bool,
+}
+
+pub async fn post_auto(
+    State(state): State<AppState>,
+    Json(body): Json<AutoToggleBody>,
+) -> impl IntoResponse {
+    let db = match state.db.as_ref() {
+        Some(d) if d.is_connected() => d,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DB indisponible — toggle non persisté",
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = set_setting_bool(db, "auto_enabled", body.enabled).await {
+        tracing::error!(error = %e, "set_setting_bool auto_enabled échoué");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Erreur DB: {e}"),
+        )
+            .into_response();
+    }
+
+    {
+        let mut inner = state.inner.lock();
+        inner.auto.enabled = body.enabled;
+        // Reset des compteurs : on évite qu'un toggle hâtif déclenche un switch
+        // au tick suivant sur la base d'une accumulation passée.
+        inner.auto.low_voltage_minutes = 0;
+        inner.auto.recover_voltage_minutes = 0;
+    }
+
+    tracing::info!(enabled = body.enabled, "Auto toggle persisté");
+    Json(AutoToggleResponse {
+        auto_enabled: body.enabled,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]

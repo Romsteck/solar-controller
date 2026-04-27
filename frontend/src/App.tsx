@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
-import { getHistory, getLiveHistory, getStatus, postSwitch, type HistoryPayload, type Range, type StatusResponse } from './api'
+import { getHistory, getLiveHistory, getStatus, postAutoToggle, postSwitch, type HistoryPayload, type Range, type StatusResponse } from './api'
+import { AutoControl } from './components/AutoControl'
 import { NetworkBadge } from './components/NetworkBadge'
 import { RangeSelector } from './components/RangeSelector'
 import { SensorCard } from './components/SensorCard'
@@ -39,6 +40,8 @@ export default function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [error, setError] = useState(false)
   const [switchError, setSwitchError] = useState<string | null>(null)
+  const [autoError, setAutoError] = useState<string | null>(null)
+  const [autoPending, setAutoPending] = useState(false)
   const [history, setHistory] = useState<History>(EMPTY_HISTORY)
   const [range, setRange] = useState<Range>('hour')
   const [historyData, setHistoryData] = useState<HistoryPayload | null>(null)
@@ -127,8 +130,30 @@ export default function App() {
     }
   }, [])
 
+  const handleAutoToggle = useCallback(async (enabled: boolean) => {
+    setAutoError(null)
+    setAutoPending(true)
+    try {
+      const r = await postAutoToggle(enabled)
+      if (!r.ok) {
+        const text = await r.text().catch(() => '')
+        setAutoError(text || `Échec : HTTP ${r.status}`)
+      } else {
+        // Optimistic update : le prochain getStatus confirmera.
+        setStatus(prev => (prev ? { ...prev, auto_enabled: enabled } : prev))
+      }
+    } catch (e) {
+      setAutoError(String((e as Error)?.message ?? e))
+    } finally {
+      setAutoPending(false)
+    }
+  }, [])
+
   const dbDown = status !== null && !status.db_connected
   const windowMinutes = Math.round(HISTORY_CAPACITY / 60)
+  const overrideUntilLabel = status?.manual_override_until
+    ? new Date(status.manual_override_until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : null
 
   return (
     <div className="app">
@@ -148,14 +173,35 @@ export default function App() {
               onSwitch={handleSwitch}
             />
           )}
+          {status && (
+            <AutoControl
+              enabled={status.auto_enabled}
+              reason={status.auto_reason}
+              message={status.auto_message}
+              manualOverride={status.manual_override_active}
+              pending={autoPending}
+              onToggle={handleAutoToggle}
+            />
+          )}
         </div>
       </header>
 
       {error && <div className="alert alert--danger">Connexion perdue…</div>}
       {switchError && <div className="alert alert--danger">{switchError}</div>}
+      {autoError && <div className="alert alert--danger">Auto : {autoError}</div>}
       {dbDown && (
         <div className="alert alert--warn">
           Base de données injoignable — historisation suspendue. Le contrôleur reste opérationnel.
+        </div>
+      )}
+      {status && !status.auto_enabled && (
+        <div className="alert alert--warn">
+          Auto-switch désactivé — bascule manuelle uniquement. La règle de sécurité tension reste active.
+        </div>
+      )}
+      {status?.manual_override_active && overrideUntilLabel && (
+        <div className="alert alert--warn">
+          Override manuel actif jusqu'à {overrideUntilLabel} — l'auto-switch ne décide rien pendant ce temps.
         </div>
       )}
 
@@ -175,6 +221,7 @@ export default function App() {
                   sensor={s}
                   label={SENSOR_LABELS[s.address] ?? `Capteur 0x${s.address.toString(16)}`}
                   voltageHistory={history.sensorVoltage[s.address] ?? []}
+                  socPercent={s.address === 0x40 ? status.soc_percent : null}
                 />
               ))
             ) : (

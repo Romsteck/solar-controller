@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::Mutex as TokioMutex;
 use serde::Serialize;
@@ -38,6 +39,66 @@ pub struct UpsReading {
     pub last_seen: i64,
 }
 
+/// État de la boucle auto-switch — séparé de la donnée capteur pour clarté.
+/// Tous les champs sont sous le même `parking_lot::Mutex` que `InnerState`,
+/// donc lecture/écriture rapide et sans empoisonnement.
+#[derive(Debug, Clone)]
+pub struct AutoState {
+    /// Toggle global. Persisté dans la table `settings`. Défaut `true` au boot.
+    pub enabled: bool,
+    /// SoC estimé depuis la tension batterie 0x40 (lissée), en pourcentage 0-100.
+    pub soc_percent: Option<f32>,
+    /// Drapeau "la batterie a atteint la tension de Float aujourd'hui". Reset à
+    /// chaque sunrise. Influence le seuil EOD.
+    pub float_reached_today: bool,
+    /// Une fois passée la fenêtre EOD, on bloque toute reprise SOLAR jusqu'au
+    /// prochain sunrise. Reset à chaque sunrise.
+    pub eod_lockout: bool,
+    /// Tant que `now < manual_override_until`, la boucle auto ne décide rien
+    /// (sauf urgence). Posé par chaque POST /api/switch manuel.
+    pub manual_override_until: Option<DateTime<Utc>>,
+    /// Timestamp du dernier switch (manuel OU auto OU watchdog). Utilisé pour
+    /// l'anti-oscillation MIN_SWITCH_GAP.
+    pub last_switch_at: Option<DateTime<Utc>>,
+    /// Dernière décision prise par la boucle auto (timestamp + raison sérialisée).
+    /// Affichée dans l'UI.
+    pub last_decision: Option<AutoDecision>,
+    /// Combien de minutes consécutives V_max5min < V_LOW (compteur utilisé par
+    /// la règle "voltage low sustained ≥ 3 min").
+    pub low_voltage_minutes: u32,
+    /// Idem pour V_max5min ≥ V_RECOVER (seuil de reprise SOLAR).
+    pub recover_voltage_minutes: u32,
+    /// Idem pour V ≥ V_FLOAT (déclenche `float_reached_today` après 10 min).
+    pub float_voltage_minutes: u32,
+}
+
+impl Default for AutoState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            soc_percent: None,
+            float_reached_today: false,
+            eod_lockout: false,
+            manual_override_until: None,
+            last_switch_at: None,
+            last_decision: None,
+            low_voltage_minutes: 0,
+            recover_voltage_minutes: 0,
+            float_voltage_minutes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoDecision {
+    pub at: DateTime<Utc>,
+    /// Raison machine-friendly (snake_case stable, utilisée comme clé) — ex.
+    /// `voltage_recovered`, `eod_recharge`, `manual_override`, `hold`.
+    pub reason: String,
+    /// Phrase humaine courte affichée dans l'UI (FR).
+    pub message: String,
+}
+
 pub struct InnerState {
     pub sensors: Vec<SensorReading>,
     pub ups: Option<UpsReading>,
@@ -50,6 +111,8 @@ pub struct InnerState {
     /// la loop sensors qui pousse à chaque tick (1 s) une ligne alignée
     /// contenant les tensions des deux capteurs et les tensions UPS courantes.
     pub live: LiveBuffer,
+    /// État de la boucle auto-switch (toggle, SoC, raisons, etc.).
+    pub auto: AutoState,
 }
 
 /// Buffer circulaire des dernières secondes. Toutes les `VecDeque` ont la
@@ -92,6 +155,23 @@ impl LiveBuffer {
         self.ups_input_v.push_back(ups.and_then(|u| u.input_voltage_v));
         self.ups_battery_v.push_back(ups.and_then(|u| u.battery_voltage_v));
     }
+
+    /// Maximum de la tension batterie (capteur 0x40) sur les N dernières
+    /// secondes du buffer. Approxime la tension repos (load passe en ON/OFF
+    /// rapide → on prend les pics les moins chargés). Retourne `None` si
+    /// aucun échantillon valide dans la fenêtre.
+    pub fn max_battery_voltage_recent(&self, secs: usize) -> Option<f32> {
+        let take = secs.min(self.sensor_grid_v.len());
+        self.sensor_grid_v
+            .iter()
+            .rev()
+            .take(take)
+            .filter_map(|v| *v)
+            .fold(None, |acc, v| match acc {
+                None => Some(v),
+                Some(m) => Some(m.max(v)),
+            })
+    }
 }
 
 fn value_for(sensors: &[SensorReading], addr: u8) -> Option<f32> {
@@ -127,6 +207,7 @@ impl AppState {
                 ups: None,
                 published_state: initial_state,
                 live: LiveBuffer::new(),
+                auto: AutoState::default(),
             })),
             relay: Arc::new(TokioMutex::new(relay)),
             db: None,

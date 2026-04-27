@@ -368,3 +368,24 @@ body {
 .dim {
   color: var(--text-dim);
 }
+
+.auto-control {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  align-items: flex-end;
+}
+
+.auto-control__row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.auto-control__reason {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.01em;
+  max-width: 18rem;
+  text-align: right;
+}

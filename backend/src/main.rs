@@ -1,3 +1,4 @@
+mod auto;
 mod db;
 mod history;
 mod recorder;
@@ -100,13 +101,25 @@ async fn main() {
     };
     app_state.db = db.clone();
 
+    // Charger les settings persistés (auto_enabled). Défaut `true` si DB
+    // injoignable ou clé absente — l'utilisateur a demandé auto-ON par défaut.
+    let auto_enabled = match db.as_ref() {
+        Some(d) => db::get_setting_bool(d, "auto_enabled", true).await,
+        None => true,
+    };
+    app_state.inner.lock().auto.enabled = auto_enabled;
+    tracing::info!(auto_enabled, "Settings chargés");
+
     // ═══════════════════════════════════════════════════════════════════════
-    // ÉTAPE 4 : spawn des loops. Sensors/UPS/watchdog tournent toujours.
+    // ÉTAPE 4 : spawn des loops. Sensors/UPS/watchdog/auto tournent toujours.
     // Recorder/weather/health-check uniquement si DB OK.
     // ═══════════════════════════════════════════════════════════════════════
     tokio::spawn(sensors::poll_loop(app_state.clone()));
     tokio::spawn(ups::poll_loop(app_state.clone()));
     tokio::spawn(watchdog::run(app_state.clone()));
+    // La boucle auto tourne même sans DB : la règle 1 (urgence tension) est notre
+    // filet de sécurité ultime, indépendante de la persistance.
+    tokio::spawn(auto::run(app_state.clone()));
 
     if let Some(d) = db.clone() {
         tokio::spawn(recorder::record_loop(app_state.clone(), d));
@@ -159,6 +172,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/status", get(routes::get_status))
         .route("/api/switch", post(routes::post_switch))
+        .route("/api/auto", post(routes::post_auto))
         .route("/api/history", get(routes::get_history))
         .route("/api/live-history", get(routes::get_live_history))
         .layer(CompressionLayer::new())

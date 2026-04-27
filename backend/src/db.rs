@@ -1,8 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 /// Pool PostgreSQL + flag de connectivité partagé.
 ///
@@ -110,4 +111,108 @@ pub async fn health_loop(db: Db) {
         let ok = matches!(result, Ok(Ok(_)));
         db.set_connected(ok);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Settings (clé/valeur persistantes — auto_enabled, etc.)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Lit un booléen depuis la table `settings`. Retourne `default` si la clé est
+/// absente, illisible, ou si la DB renvoie une erreur (mode dégradé).
+pub async fn get_setting_bool(db: &Db, key: &str, default: bool) -> bool {
+    match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(db.pool())
+        .await
+    {
+        Ok(Some(v)) => match v.as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            other => {
+                tracing::warn!(key, value = other, "valeur settings non-bool, fallback default");
+                default
+            }
+        },
+        Ok(None) => default,
+        Err(e) => {
+            tracing::warn!(error = %e, key, "lecture settings échouée, fallback default");
+            default
+        }
+    }
+}
+
+/// Écrit un booléen dans la table `settings` (UPSERT).
+pub async fn set_setting_bool(db: &Db, key: &str, value: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO settings (key, value, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = now()",
+    )
+    .bind(key)
+    .bind(if value { "true" } else { "false" })
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// relay_events : audit trail des switchs (manuel + auto + watchdog)
+// ─────────────────────────────────────────────────────────────────────────
+
+pub async fn log_relay_event(
+    db: &Db,
+    ts: DateTime<Utc>,
+    state: &str,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO relay_events (ts, state, reason)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (ts) DO NOTHING",
+    )
+    .bind(ts)
+    .bind(state)
+    .bind(reason)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// forecast_daily : prévisions journalières (sunrise/sunset/radiation)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ForecastDay {
+    pub date: NaiveDate,
+    pub sunrise: Option<DateTime<Utc>>,
+    pub sunset: Option<DateTime<Utc>>,
+    pub shortwave_sum_kwh: Option<f32>,
+}
+
+/// Récupère les prévisions de la fenêtre [hier, aujourd'hui, demain].
+/// Utilisé par la boucle auto pour déterminer "today" et "tomorrow"
+/// indépendamment du fuseau horaire de la session PostgreSQL.
+pub async fn fetch_forecast_window(db: &Db) -> Result<Vec<ForecastDay>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT date, sunrise, sunset, shortwave_sum_kwh
+         FROM forecast_daily
+         WHERE date >= CURRENT_DATE - INTERVAL '1 day'
+           AND date <= CURRENT_DATE + INTERVAL '2 days'
+         ORDER BY date ASC",
+    )
+    .fetch_all(db.pool())
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(ForecastDay {
+            date: row.try_get("date")?,
+            sunrise: row.try_get("sunrise")?,
+            sunset: row.try_get("sunset")?,
+            shortwave_sum_kwh: row.try_get("shortwave_sum_kwh")?,
+        });
+    }
+    Ok(out)
 }
