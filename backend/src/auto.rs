@@ -40,7 +40,10 @@ const V_FLOAT: f32 = 27.2;
 const V_FLOAT_MIN_MINUTES: u32 = 10;
 
 /// Délai entre `now` et `sunset` à partir duquel on déclenche la fenêtre EOD.
-const EOD_OFFSET: chrono::Duration = chrono::Duration::hours(2);
+/// 3h calibré pour Bruxelles (50°N) avec un panneau dont le rendement chute
+/// nettement quand le soleil descend sous ~15° : sunset 21h en été → fin
+/// utile vers 18h ; sunset 17h en hiver → fin utile vers 14h.
+const EOD_OFFSET: chrono::Duration = chrono::Duration::hours(3);
 
 /// Anti-oscillation : pas de switch auto si < 10 min depuis le dernier (sauf urgence).
 /// C'est aussi notre seul mécanisme pour respecter un switch manuel : l'auto

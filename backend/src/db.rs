@@ -5,14 +5,16 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-/// Pool PostgreSQL + flag de connectivité partagé.
+/// Pool PostgreSQL + flags partagés.
 ///
-/// Le flag `connected` est lu par `/api/status` (sans bloquer) et mis à jour
-/// par `health_loop`. La transition est loggée une fois (pas de spam).
+/// `connected` est lu par `/api/status` (sans bloquer) et mis à jour par
+/// `health_loop`. `schema_initialized` empêche de relancer les migrations à
+/// chaque reconnexion (one-shot, idempotent quand même côté SQL).
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
     connected: Arc<AtomicBool>,
+    schema_initialized: Arc<AtomicBool>,
 }
 
 impl Db {
@@ -28,7 +30,7 @@ impl Db {
         let prev = self.connected.swap(value, Ordering::Relaxed);
         if prev != value {
             if value {
-                tracing::info!("DB reconnectée");
+                tracing::info!("DB connectée");
             } else {
                 tracing::warn!("DB déconnectée");
             }
@@ -36,56 +38,21 @@ impl Db {
     }
 }
 
-/// Tente de se connecter à la DB avec un retry borné.
-/// Max ~21s : 3 essais × (5s connect_timeout + 2s sleep entre essais).
-/// Au succès, applique les migrations idempotentes.
-/// Au cumul de tous les échecs, retourne None (le service tourne en mode dégradé).
-pub async fn connect_with_retry(url: &str) -> Option<Db> {
-    const MAX_ATTEMPTS: u32 = 3;
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-    const RETRY_DELAY: Duration = Duration::from_secs(2);
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        match PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(CONNECT_TIMEOUT)
-            .connect(url)
-            .await
-        {
-            Ok(pool) => {
-                if let Err(e) = sqlx::query("SELECT 1").execute(&pool).await {
-                    tracing::warn!(error = %e, attempt, "DB ping a échoué après connect");
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(RETRY_DELAY).await;
-                        continue;
-                    }
-                    return None;
-                }
-
-                let db = Db {
-                    pool,
-                    connected: Arc::new(AtomicBool::new(true)),
-                };
-
-                if let Err(e) = run_migrations(&db).await {
-                    tracing::error!(error = %e, "Migrations DB échouées — service en mode dégradé");
-                    return None;
-                }
-
-                tracing::info!("DB connectée (essai {}/{})", attempt, MAX_ATTEMPTS);
-                return Some(db);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, attempt, max = MAX_ATTEMPTS, "Connexion DB échouée");
-                if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-
-    tracing::warn!("DB injoignable après {} essais — mode dégradé", MAX_ATTEMPTS);
-    None
+/// Construit un pool DB en mode "lazy" : aucun socket n'est ouvert tant qu'on
+/// ne fait pas de query. Permet au service de démarrer même si la DB est down
+/// au boot — `health_loop` se chargera de retenter régulièrement.
+///
+/// Échoue uniquement si l'URL est syntaxiquement invalide.
+pub fn connect_lazy(url: &str) -> Result<Db, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_lazy(url)?;
+    Ok(Db {
+        pool,
+        connected: Arc::new(AtomicBool::new(false)),
+        schema_initialized: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 async fn run_migrations(db: &Db) -> anyhow::Result<()> {
@@ -94,22 +61,61 @@ async fn run_migrations(db: &Db) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Boucle de health-check : ping toutes les 60s, met à jour `connected`.
-/// Ne logge que les transitions (set_connected interne).
+/// Tente un ping + (si nécessaire) les migrations. Met à jour le flag
+/// `connected` selon le résultat. Retourne `true` si la DB répond ET que le
+/// schéma est initialisé.
+pub async fn try_connect_and_init(db: &Db) -> bool {
+    // Ping avec timeout court — ne bloque pas la boucle si la DB répond mal.
+    let ping_ok = matches!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::query("SELECT 1").execute(&db.pool),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    if !ping_ok {
+        db.set_connected(false);
+        return false;
+    }
+
+    // Init schema (one-shot, mais SQL idempotent → safe si on retry).
+    if !db.schema_initialized.load(Ordering::Relaxed) {
+        match tokio::time::timeout(Duration::from_secs(10), run_migrations(db)).await {
+            Ok(Ok(())) => {
+                db.schema_initialized.store(true, Ordering::Relaxed);
+                tracing::info!("Schéma DB initialisé");
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "Migrations DB échouées");
+                db.set_connected(false);
+                return false;
+            }
+            Err(_) => {
+                tracing::error!("Migrations DB timeout");
+                db.set_connected(false);
+                return false;
+            }
+        }
+    }
+
+    db.set_connected(true);
+    true
+}
+
+/// Boucle de santé : retente toutes les 10s. Sert à la fois de monitoring
+/// (transition logguée via `set_connected`) et de reconnect — sqlx réouvrira
+/// les sockets sous-jacents automatiquement, on a juste besoin de pinger pour
+/// déclencher / vérifier ça.
 pub async fn health_loop(db: Db) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    const TICK: Duration = Duration::from_secs(10);
+    let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await; // skip le tick immédiat (juste après connect_with_retry)
+    interval.tick().await; // skip le tick immédiat (le boot a déjà tenté un ping)
 
     loop {
         interval.tick().await;
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            sqlx::query("SELECT 1").execute(db.pool()),
-        )
-        .await;
-        let ok = matches!(result, Ok(Ok(_)));
-        db.set_connected(ok);
+        try_connect_and_init(&db).await;
     }
 }
 

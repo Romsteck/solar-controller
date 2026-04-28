@@ -11,9 +11,15 @@ mod watchdog;
 mod weather;
 
 use std::time::Duration;
-use axum::{routing::{get, post}, Router};
+use axum::{
+    http::{header, HeaderValue},
+    routing::{get, post},
+    Router,
+};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
 use crate::state::Network;
 
 #[cfg(unix)]
@@ -86,25 +92,45 @@ async fn main() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ÉTAPE 3 : init DB (avec retry borné, ~21s max). Le relais est déjà
-    // sécurisé en Grid, donc un timeout DB ici n'a pas d'impact sur la charge.
-    // Si la DB est injoignable, on passe en mode dégradé (pas de recorder, pas
-    // de météo, /api/history → 503). Le live /api/status fonctionne toujours.
+    // ÉTAPE 3 : init DB en mode "lazy". Le pool est construit sans contacter
+    // PostgreSQL — la connexion réelle se fait à la première query, et
+    // `db::health_loop` retente toutes les 10s en cas d'échec persistant.
+    // Si la DB est injoignable au boot, le service démarre quand même : les
+    // loops dépendantes (recorder, weather) écriront en best-effort, et le
+    // mode "connected" se remettra automatiquement quand la DB reviendra.
     // ═══════════════════════════════════════════════════════════════════════
-    let database_url = std::env::var("DATABASE_URL").ok();
-    let db = match database_url {
-        Some(url) => db::connect_with_retry(&url).await,
-        None => {
-            tracing::warn!("DATABASE_URL non définie — mode dégradé (pas de persistance)");
-            None
-        }
-    };
+    let db = std::env::var("DATABASE_URL")
+        .ok()
+        .and_then(|url| match db::connect_lazy(&url) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::error!(error = %e, "URL DB invalide — mode dégradé permanent");
+                None
+            }
+        });
+    if db.is_none() {
+        tracing::warn!("DATABASE_URL non définie/invalide — mode dégradé (pas de persistance)");
+    }
     app_state.db = db.clone();
 
-    // Charger les settings persistés (auto_enabled). Défaut `true` si DB
-    // injoignable ou clé absente — l'utilisateur a demandé auto-ON par défaut.
+    // Tentative initiale de connexion (best-effort, 5s max). Permet de
+    // charger `auto_enabled` rapidement si la DB est dispo. Sinon fallback
+    // à `true` et `health_loop` reprendra dans 10s.
     let auto_enabled = match db.as_ref() {
-        Some(d) => db::get_setting_bool(d, "auto_enabled", true).await,
+        Some(d) => {
+            let connected = matches!(
+                tokio::time::timeout(Duration::from_secs(5), db::try_connect_and_init(d)).await,
+                Ok(true)
+            );
+            if connected {
+                db::get_setting_bool(d, "auto_enabled", true).await
+            } else {
+                tracing::warn!(
+                    "DB indispo au boot — auto_enabled défaut à true, retry health_loop /10s"
+                );
+                true
+            }
+        }
         None => true,
     };
     app_state.inner.lock().auto.enabled = auto_enabled;
@@ -112,7 +138,9 @@ async fn main() {
 
     // ═══════════════════════════════════════════════════════════════════════
     // ÉTAPE 4 : spawn des loops. Sensors/UPS/watchdog/auto tournent toujours.
-    // Recorder/weather/health-check uniquement si DB OK.
+    // Recorder/weather/health-loop tournent dès que DATABASE_URL est définie,
+    // peu importe l'état actuel de la DB — chacune se rabat en best-effort
+    // si is_connected()=false, et reprend automatiquement à la reconnexion.
     // ═══════════════════════════════════════════════════════════════════════
     tokio::spawn(sensors::poll_loop(app_state.clone()));
     tokio::spawn(ups::poll_loop(app_state.clone()));
@@ -122,9 +150,9 @@ async fn main() {
     tokio::spawn(auto::run(app_state.clone()));
 
     if let Some(d) = db.clone() {
-        tokio::spawn(recorder::record_loop(app_state.clone(), d));
-    }
-    if let Some(d) = db.clone() {
+        tokio::spawn(db::health_loop(d.clone()));
+        tokio::spawn(recorder::record_loop(app_state.clone(), d.clone()));
+
         let lat = std::env::var("WEATHER_LAT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok());
@@ -137,9 +165,6 @@ async fn main() {
             }
             _ => tracing::warn!("WEATHER_LAT/WEATHER_LON manquants — météo désactivée"),
         }
-    }
-    if let Some(d) = db.clone() {
-        tokio::spawn(db::health_loop(d));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -169,12 +194,29 @@ async fn main() {
     // Compression gzip uniquement sur les routes API (pas sur les assets
     // statiques pré-compressés par Vite).
     // ═══════════════════════════════════════════════════════════════════════
+    // Layers appliqués UNIQUEMENT aux routes /api/* (pas au fallback statique).
+    // - Connection: close → désactive le keep-alive HTTP sur les endpoints
+    //   polés en boucle (status à 1 Hz). Évite le pile-up de sockets en
+    //   CLOSE-WAIT que des clients externes (Grafana/HA, etc.) provoquent
+    //   en ne fermant pas proprement leurs connexions keep-alive.
+    // - TimeoutLayer 15s → tue toute requête qui traîne (handler bloqué,
+    //   DB lente, etc.) plutôt que d'occuper un fd indéfiniment.
+    // Les assets statiques (frontend/dist) gardent keep-alive (chargés
+    //   rarement, bénéficient du multiplexage navigateur).
     let app = Router::new()
         .route("/api/status", get(routes::get_status))
         .route("/api/switch", post(routes::post_switch))
         .route("/api/auto", post(routes::post_auto))
         .route("/api/history", get(routes::get_history))
         .route("/api/live-history", get(routes::get_live_history))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONNECTION,
+            HeaderValue::from_static("close"),
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(15),
+        ))
         .layer(CompressionLayer::new())
         .fallback_service(ServeDir::new("frontend/dist"))
         .with_state(app_state);

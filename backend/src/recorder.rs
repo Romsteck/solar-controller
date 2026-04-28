@@ -16,6 +16,13 @@ pub async fn record_loop(state: AppState, db: Db) {
     loop {
         interval.tick().await;
 
+        // Si la DB est marquée déconnectée par health_loop, on saute
+        // silencieusement — pas de tentative d'INSERT, pas de spam de warns.
+        // Quand health_loop la repassera connected (10s max), on reprend.
+        if !db.is_connected() {
+            continue;
+        }
+
         let (sensors, ups) = {
             let inner = state.inner.lock();
             (inner.sensors.clone(), inner.ups.clone())
