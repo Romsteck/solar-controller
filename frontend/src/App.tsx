@@ -177,6 +177,10 @@ export default function App() {
               message={status.auto_message}
               pending={autoPending}
               onToggle={handleAutoToggle}
+              eodAt={status.eod_at}
+              eodThresholdV={status.eod_threshold_v}
+              eodLockout={status.eod_lockout}
+              floatReachedToday={status.float_reached_today}
             />
           )}
         </div>

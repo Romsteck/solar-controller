@@ -32,6 +32,8 @@ pub struct StatusResponse {
     soc_percent: Option<f32>,
     float_reached_today: bool,
     eod_lockout: bool,
+    eod_at: Option<chrono::DateTime<Utc>>,
+    eod_threshold_v: Option<f32>,
 }
 
 /// Buffer live 5 min × 1 Hz, sérialisé orienté série pour minimiser les bytes.
@@ -79,6 +81,8 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         soc_percent: inner.auto.soc_percent,
         float_reached_today: inner.auto.float_reached_today,
         eod_lockout: inner.auto.eod_lockout,
+        eod_at: inner.auto.eod_at,
+        eod_threshold_v: inner.auto.eod_threshold_v,
     })
 }
 

@@ -30,6 +30,8 @@ export interface StatusResponse {
   soc_percent: number | null
   float_reached_today: boolean
   eod_lockout: boolean
+  eod_at: string | null
+  eod_threshold_v: number | null
 }
 
 export type Range = 'hour' | 'day' | 'week' | 'month'

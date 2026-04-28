@@ -389,3 +389,12 @@ body {
   max-width: 18rem;
   text-align: right;
 }
+
+.auto-control__eod {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  max-width: 22rem;
+  text-align: right;
+}

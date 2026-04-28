@@ -68,6 +68,12 @@ pub struct AutoState {
     pub recover_voltage_minutes: u32,
     /// Idem pour V ≥ V_FLOAT (déclenche `float_reached_today` après 10 min).
     pub float_voltage_minutes: u32,
+    /// Heure prévue du déclenchement EOD aujourd'hui (sunset − 3h). `None` si
+    /// pas de prévision sunset disponible. Recalculé à chaque tick auto.
+    pub eod_at: Option<DateTime<Utc>>,
+    /// Seuil de tension EOD calculé dynamiquement selon météo+flag float.
+    /// `None` si pas de calcul possible (forecast indispo).
+    pub eod_threshold_v: Option<f32>,
 }
 
 impl Default for AutoState {
@@ -82,6 +88,8 @@ impl Default for AutoState {
             low_voltage_minutes: 0,
             recover_voltage_minutes: 0,
             float_voltage_minutes: 0,
+            eod_at: None,
+            eod_threshold_v: None,
         }
     }
 }

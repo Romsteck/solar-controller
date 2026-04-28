@@ -341,6 +341,7 @@ async fn tick_once(
     let today_sunrise = today.and_then(|t| t.sunrise);
     let today_sunset = today.and_then(|t| t.sunset);
     let tomorrow_radiation = tomorrow.and_then(|t| t.shortwave_sum_kwh);
+    let eod_at = today_sunset.map(|s| s - EOD_OFFSET);
 
     // Snapshot des données + reset quotidien si on a passé sunrise.
     let (auto_snapshot, current_relay, voltage_inst, voltage_max5min) = {
@@ -375,6 +376,15 @@ async fn tick_once(
         if let Some(v) = v_max5.or(v_inst) {
             inner.auto.soc_percent = Some(soc_from_voltage(v));
         }
+
+        // Exposer l'heure et le seuil EOD calculés (pour l'UI). N'affecte pas
+        // la décision elle-même, c'est juste de l'observabilité.
+        inner.auto.eod_at = eod_at;
+        inner.auto.eod_threshold_v = if today_sunset.is_some() {
+            Some(eod_threshold(tomorrow_radiation, inner.auto.float_reached_today))
+        } else {
+            None
+        };
 
         // Compteurs de soutien (incrémentés par minute).
         let v_for_counter = v_max5.unwrap_or(0.0);
