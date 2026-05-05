@@ -1,6 +1,7 @@
 import { SensorReading } from '../api'
 import { Bar } from './Bar'
 import { Sparkline } from './Sparkline'
+import { VoltageTrend } from './VoltageTrend'
 
 interface Props {
   sensor: SensorReading
@@ -29,8 +30,19 @@ export function SensorCard({ sensor, label, voltageHistory, socPercent }: Props)
 
       <div style={{ marginBottom: '0.85rem' }}>
         <span className="metric-label">Tension</span>
-        <div className="metric-value" style={{ fontSize: '2rem', marginTop: '0.15rem' }}>
-          {sensor.bus_voltage_v.toFixed(2)}<span className="metric-unit">V</span>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.75rem',
+            flexWrap: 'wrap',
+            marginTop: '0.15rem',
+          }}
+        >
+          <div className="metric-value" style={{ fontSize: '2rem', lineHeight: 1 }}>
+            {sensor.bus_voltage_v.toFixed(2)}<span className="metric-unit">V</span>
+          </div>
+          <VoltageTrend values={voltageHistory} />
         </div>
       </div>
 

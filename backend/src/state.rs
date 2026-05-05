@@ -74,6 +74,15 @@ pub struct AutoState {
     /// Seuil de tension EOD calculé dynamiquement selon météo+flag float.
     /// `None` si pas de calcul possible (forecast indispo).
     pub eod_threshold_v: Option<f32>,
+    /// Verrou Solar pour la journée — posé après N tentatives infructueuses
+    /// (Solar repris puis voltage_low_sustained dans la fenêtre `SOLAR_FAIL_WINDOW`).
+    /// Bloque la Règle 4 jusqu'au prochain sunrise. Mirror de `eod_lockout`.
+    pub solar_lockout: bool,
+    /// Compteur d'échecs Solar du jour. Reset au sunrise.
+    pub solar_failed_attempts_today: u32,
+    /// Timestamp de la dernière reprise Solar (Règle 4) — sert à détecter un
+    /// échec si la Règle 3 retire la charge dans la foulée.
+    pub last_solar_attempt_at: Option<DateTime<Utc>>,
 }
 
 impl Default for AutoState {
@@ -90,6 +99,9 @@ impl Default for AutoState {
             float_voltage_minutes: 0,
             eod_at: None,
             eod_threshold_v: None,
+            solar_lockout: false,
+            solar_failed_attempts_today: 0,
+            last_solar_attempt_at: None,
         }
     }
 }

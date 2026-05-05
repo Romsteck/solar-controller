@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use crate::db::{fetch_forecast_window, log_relay_event, ForecastDay};
+use crate::db::{fetch_forecast_window, fetch_latest_weather, log_relay_event, ForecastDay};
 use crate::relay::RelayState;
 use crate::state::{AppState, AutoDecision, AutoState, Network};
 
@@ -49,6 +49,24 @@ const EOD_OFFSET: chrono::Duration = chrono::Duration::hours(3);
 /// C'est aussi notre seul mécanisme pour respecter un switch manuel : l'auto
 /// ne pourra pas défaire la décision utilisateur pendant ces 10 min.
 const MIN_SWITCH_GAP: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Garde anti-oscillation jour : fenêtre dans laquelle un retour Grid après une
+/// reprise Solar est compté comme un échec. Au-delà, c'est un cycle météo
+/// "normal" (couvert tardif, pas un raté du panneau).
+const SOLAR_FAIL_WINDOW: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Nombre d'échecs Solar avant de poser le verrou journalier (mirror EOD).
+const SOLAR_LOCKOUT_AFTER: u32 = 2;
+
+/// Garde "météo défavorable" pour la Règle 4 : on ne tente pas de reprise
+/// Solar quand la nébulosité est haute ET le rayonnement faible. Fail-open :
+/// si une des deux valeurs est absente, on n'applique pas la garde.
+const CLOUD_HIGH_PCT: f32 = 80.0;
+const RADIATION_LOW_W: f32 = 200.0;
+
+/// Âge max d'un weather_sample pour le considérer dans la décision (30 min).
+/// Au-delà, on considère qu'on n'a pas de donnée fraîche → fail-open.
+const WEATHER_MAX_AGE: Duration = Duration::from_secs(1800);
 
 /// Période de la boucle de décision.
 const TICK: Duration = Duration::from_secs(60);
@@ -130,6 +148,10 @@ pub struct DecisionInputs {
     pub today_sunset: Option<DateTime<Utc>>,
     /// Prévision rayonnement total demain (kWh/m²). `None` → fallback nominal.
     pub tomorrow_radiation_kwh: Option<f32>,
+    /// Nébulosité courante (% 0-100), lecture < 30 min. `None` → fail-open.
+    pub current_cloud_pct: Option<f32>,
+    /// Rayonnement courant (W/m²), lecture < 30 min. `None` → fail-open.
+    pub current_radiation_w: Option<f32>,
 }
 
 /// Calcule le seuil EOD selon la prévision de demain et le drapeau Float
@@ -238,8 +260,9 @@ pub fn decide(auto: &AutoState, inputs: &DecisionInputs) -> Decision {
     }
 
     // Règle 4 : reprise SOLAR autorisée — V remontée + dans la fenêtre solaire +
-    // pas en lockout EOD.
+    // pas en lockout EOD + pas en lockout journalier solaire.
     if !auto.eod_lockout
+        && !auto.solar_lockout
         && auto.recover_voltage_minutes >= V_RECOVER_MIN_MINUTES
         && in_solar_window(inputs)
         && inputs.current_relay != RelayState::Solar
@@ -250,6 +273,21 @@ pub fn decide(auto: &AutoState, inputs: &DecisionInputs) -> Decision {
                 reason: "anti_oscillation",
                 message: "Reprise SOLAR souhaitée mais switch trop récent".to_string(),
             };
+        }
+        // Garde météo : si le ciel est clairement défavorable (nébulosité haute
+        // ET rayonnement faible), on ne tente pas — ça éviterait un cycle de
+        // relais inutile. Fail-open si données manquantes.
+        if let (Some(cloud), Some(rad)) = (inputs.current_cloud_pct, inputs.current_radiation_w) {
+            if cloud >= CLOUD_HIGH_PCT && rad < RADIATION_LOW_W {
+                return Decision {
+                    action: Action::Hold,
+                    reason: "weather_unfavorable",
+                    message: format!(
+                        "Reprise Solar reportée — ciel couvert ({:.0}%, {:.0} W/m²)",
+                        cloud, rad
+                    ),
+                };
+            }
         }
         return Decision {
             action: Action::SwitchToSolar,
@@ -327,20 +365,27 @@ async fn tick_once(
     let now = Utc::now();
 
     // Récupérer la prévision (peut être vide si DB down ou pas encore peuplé).
-    let forecast = match state.db.as_ref() {
+    let (forecast, latest_weather) = match state.db.as_ref() {
         Some(db) if db.is_connected() => {
-            fetch_forecast_window(db).await.unwrap_or_else(|e| {
+            let f = fetch_forecast_window(db).await.unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "fetch_forecast_window échoué");
                 Vec::new()
-            })
+            });
+            let w = fetch_latest_weather(db, WEATHER_MAX_AGE).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "fetch_latest_weather échoué");
+                None
+            });
+            (f, w)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), None),
     };
 
     let (today, tomorrow) = select_today_tomorrow(&forecast, now);
     let today_sunrise = today.and_then(|t| t.sunrise);
     let today_sunset = today.and_then(|t| t.sunset);
     let tomorrow_radiation = tomorrow.and_then(|t| t.shortwave_sum_kwh);
+    let current_cloud_pct = latest_weather.as_ref().and_then(|w| w.cloud_cover_pct);
+    let current_radiation_w = latest_weather.as_ref().and_then(|w| w.shortwave_wm2);
     let eod_at = today_sunset.map(|s| s - EOD_OFFSET);
 
     // Snapshot des données + reset quotidien si on a passé sunrise.
@@ -355,12 +400,19 @@ async fn tick_once(
                 None => true,
             };
             if crossed && now >= sr {
-                if inner.auto.float_reached_today || inner.auto.eod_lockout {
+                if inner.auto.float_reached_today
+                    || inner.auto.eod_lockout
+                    || inner.auto.solar_lockout
+                    || inner.auto.solar_failed_attempts_today > 0
+                {
                     tracing::info!("Reset quotidien (sunrise atteint)");
                 }
                 inner.auto.float_reached_today = false;
                 inner.auto.eod_lockout = false;
                 inner.auto.float_voltage_minutes = 0;
+                inner.auto.solar_lockout = false;
+                inner.auto.solar_failed_attempts_today = 0;
+                inner.auto.last_solar_attempt_at = None;
                 *last_sunrise_seen = Some(sr);
             }
         }
@@ -428,6 +480,8 @@ async fn tick_once(
         today_sunrise,
         today_sunset,
         tomorrow_radiation_kwh: tomorrow_radiation,
+        current_cloud_pct,
+        current_radiation_w,
     };
 
     let decision = decide(&auto_snapshot, &inputs);
@@ -481,8 +535,53 @@ async fn tick_once(
                 );
                 let result = relay.switch_to(target, SWITCH_AUTO_DELAY).await;
                 let new_state = relay.current_state();
-                state.inner.lock().published_state = new_state;
-                state.inner.lock().auto.last_switch_at = Some(now);
+                {
+                    let mut inner = state.inner.lock();
+                    inner.published_state = new_state;
+                    inner.auto.last_switch_at = Some(now);
+
+                    // Suivi des tentatives Solar pour le verrou journalier.
+                    // - Reprise Solar (Règle 4 / "voltage_recovered") : on note
+                    //   le timestamp pour pouvoir mesurer la durée de tenue.
+                    // - Retour Grid sur "voltage_low_sustained" si la dernière
+                    //   tentative est dans `SOLAR_FAIL_WINDOW` : c'est un échec.
+                    //   Au-delà de `SOLAR_LOCKOUT_AFTER` échecs cumulés sur la
+                    //   journée, on pose `solar_lockout` (mirror EOD).
+                    if result.is_ok() {
+                        match (decision.reason, new_state) {
+                            ("voltage_recovered", RelayState::Solar) => {
+                                inner.auto.last_solar_attempt_at = Some(now);
+                            }
+                            ("voltage_low_sustained", RelayState::Grid) => {
+                                let failed = inner
+                                    .auto
+                                    .last_solar_attempt_at
+                                    .map(|t| now.signed_duration_since(t) < SOLAR_FAIL_WINDOW)
+                                    .unwrap_or(false);
+                                if failed {
+                                    inner.auto.solar_failed_attempts_today =
+                                        inner.auto.solar_failed_attempts_today.saturating_add(1);
+                                    let n = inner.auto.solar_failed_attempts_today;
+                                    if n >= SOLAR_LOCKOUT_AFTER && !inner.auto.solar_lockout {
+                                        inner.auto.solar_lockout = true;
+                                        tracing::warn!(
+                                            attempts = n,
+                                            "Solar lockout posé : {} tentatives infructueuses dans la journée",
+                                            n
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            attempts = n,
+                                            "Tentative Solar échouée ({} cumul aujourd'hui)",
+                                            n
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 match result {
                     Ok(()) => {
                         tracing::info!(?new_state, "auto: switch OK");
@@ -582,6 +681,8 @@ mod tests {
             today_sunrise: Some(dt(6)),
             today_sunset: Some(dt(20)),
             tomorrow_radiation_kwh: Some(3.0),
+            current_cloud_pct: None,
+            current_radiation_w: None,
         }
     }
 
@@ -713,6 +814,86 @@ mod tests {
         inputs.now = dt(12);
         let mut auto = AutoState::default();
         auto.last_switch_at = Some(dt(12) - chrono::Duration::minutes(1));
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::SwitchToGrid);
+        assert_eq!(d.reason, "emergency_low_voltage");
+    }
+
+    #[test]
+    fn solar_lockout_blocks_rule4() {
+        // V remontée + dans la fenêtre solaire, mais solar_lockout posé →
+        // pas de reprise.
+        let inputs = base_inputs(Some(26.5), Some(26.5), RelayState::Grid);
+        let mut auto = AutoState::default();
+        auto.recover_voltage_minutes = 5;
+        auto.solar_lockout = true;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::Hold);
+        assert_ne!(d.reason, "voltage_recovered");
+    }
+
+    #[test]
+    fn solar_lockout_does_not_block_emergency() {
+        // Même avec solar_lockout, l'urgence retourne sur Grid.
+        let inputs = base_inputs(Some(24.0), Some(24.0), RelayState::Solar);
+        let mut auto = AutoState::default();
+        auto.solar_lockout = true;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::SwitchToGrid);
+        assert_eq!(d.reason, "emergency_low_voltage");
+    }
+
+    #[test]
+    fn weather_unfavorable_blocks_rule4() {
+        let mut inputs = base_inputs(Some(26.5), Some(26.5), RelayState::Grid);
+        inputs.current_cloud_pct = Some(90.0);
+        inputs.current_radiation_w = Some(50.0);
+        let mut auto = AutoState::default();
+        auto.recover_voltage_minutes = 5;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::Hold);
+        assert_eq!(d.reason, "weather_unfavorable");
+    }
+
+    #[test]
+    fn weather_unfavorable_fail_open_when_data_missing() {
+        // current_cloud_pct = None → la garde ne s'applique pas.
+        let inputs = base_inputs(Some(26.5), Some(26.5), RelayState::Grid);
+        let mut auto = AutoState::default();
+        auto.recover_voltage_minutes = 5;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::SwitchToSolar);
+    }
+
+    #[test]
+    fn weather_unfavorable_fail_open_when_only_one_field_present() {
+        let mut inputs = base_inputs(Some(26.5), Some(26.5), RelayState::Grid);
+        inputs.current_cloud_pct = Some(90.0);
+        inputs.current_radiation_w = None;
+        let mut auto = AutoState::default();
+        auto.recover_voltage_minutes = 5;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::SwitchToSolar);
+    }
+
+    #[test]
+    fn weather_unfavorable_does_not_apply_below_threshold() {
+        // Cloud haut mais radiation suffisante → on tente quand même.
+        let mut inputs = base_inputs(Some(26.5), Some(26.5), RelayState::Grid);
+        inputs.current_cloud_pct = Some(85.0);
+        inputs.current_radiation_w = Some(250.0);
+        let mut auto = AutoState::default();
+        auto.recover_voltage_minutes = 5;
+        let d = decide(&auto, &inputs);
+        assert_eq!(d.action, Action::SwitchToSolar);
+    }
+
+    #[test]
+    fn weather_unfavorable_does_not_block_emergency() {
+        let mut inputs = base_inputs(Some(24.0), Some(24.0), RelayState::Solar);
+        inputs.current_cloud_pct = Some(95.0);
+        inputs.current_radiation_w = Some(20.0);
+        let auto = AutoState::default();
         let d = decide(&auto, &inputs);
         assert_eq!(d.action, Action::SwitchToGrid);
         assert_eq!(d.reason, "emergency_low_voltage");

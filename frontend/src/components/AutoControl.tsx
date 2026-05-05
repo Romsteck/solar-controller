@@ -10,6 +10,8 @@ interface Props {
   eodThresholdV: number | null
   eodLockout: boolean
   floatReachedToday: boolean
+  solarLockout: boolean
+  solarFailedAttemptsToday: number
 }
 
 const REASON_TONE: Record<string, Tone> = {
@@ -19,6 +21,7 @@ const REASON_TONE: Record<string, Tone> = {
   voltage_recovered: 'ok',
   auto_disabled: 'muted',
   anti_oscillation: 'muted',
+  weather_unfavorable: 'muted',
   hold: 'muted',
 }
 
@@ -39,6 +42,8 @@ export function AutoControl({
   eodThresholdV,
   eodLockout,
   floatReachedToday,
+  solarLockout,
+  solarFailedAttemptsToday,
 }: Props) {
   const tone: Tone = enabled
     ? REASON_TONE[reason ?? 'hold'] ?? 'accent'
@@ -80,6 +85,11 @@ export function AutoControl({
         </div>
       )}
       {eodLine && <div className="auto-control__eod">{eodLine}</div>}
+      {solarLockout && (
+        <div className="auto-control__eod">
+          Solar lockout — {solarFailedAttemptsToday} tentative{solarFailedAttemptsToday > 1 ? 's' : ''} infructueuse{solarFailedAttemptsToday > 1 ? 's' : ''}, reprise demain
+        </div>
+      )}
     </div>
   )
 }

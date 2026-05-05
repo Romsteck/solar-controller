@@ -181,6 +181,8 @@ export default function App() {
               eodThresholdV={status.eod_threshold_v}
               eodLockout={status.eod_lockout}
               floatReachedToday={status.float_reached_today}
+              solarLockout={status.solar_lockout}
+              solarFailedAttemptsToday={status.solar_failed_attempts_today}
             />
           )}
         </div>
@@ -244,12 +246,12 @@ export default function App() {
 
             {historyData ? (
               <div className="history-grid">
-                <HistoryTile label="Tension batterie (0x40)" values={historyData.sensor_grid_v} />
-                <HistoryTile label="Tension solaire (0x41)" values={historyData.sensor_solar_v} accent="var(--solar)" />
-                <HistoryTile label="UPS — entrée" values={historyData.ups_input_v} accent="var(--accent)" />
-                <HistoryTile label="UPS — batterie" values={historyData.ups_battery_v} accent="var(--ok)" />
-                <HistoryTile label="Météo — radiation (W/m²)" values={historyData.weather_radiation} accent="var(--warn)" />
-                <HistoryTile label="Météo — couverture nuageuse (%)" values={historyData.weather_cloud_pct} accent="#94a3b8" />
+                <HistoryTile label="Tension batterie (0x40)" values={historyData.sensor_grid_v} unit="V" decimals={2} />
+                <HistoryTile label="Tension solaire (0x41)" values={historyData.sensor_solar_v} accent="var(--solar)" unit="V" decimals={2} />
+                <HistoryTile label="UPS — entrée" values={historyData.ups_input_v} accent="var(--accent)" unit="V" decimals={1} />
+                <HistoryTile label="UPS — batterie" values={historyData.ups_battery_v} accent="var(--ok)" unit="V" decimals={2} />
+                <HistoryTile label="Soleil — rayonnement" values={historyData.weather_radiation} accent="var(--warn)" unit="W/m²" qualify={qualifyRadiation} />
+                <HistoryTile label="Soleil — nébulosité" values={historyData.weather_cloud_pct} accent="#94a3b8" unit="%" qualify={qualifyCloudCover} />
               </div>
             ) : !historyError ? (
               <div className="card dim">Chargement de l'historique…</div>
@@ -263,11 +265,57 @@ export default function App() {
   )
 }
 
-function HistoryTile({ label, values, accent }: { label: string; values: (number | null)[]; accent?: string }) {
+interface HistoryTileProps {
+  label: string
+  values: (number | null)[]
+  accent?: string
+  unit?: string
+  decimals?: number
+  qualify?: (value: number) => string
+}
+
+function HistoryTile({ label, values, accent, unit, decimals = 1, qualify }: HistoryTileProps) {
+  // Dernière valeur non-null du buffer (la plus récente).
+  let latest: number | null = null
+  for (let i = values.length - 1; i >= 0; i--) {
+    const v = values[i]
+    if (v != null && Number.isFinite(v)) {
+      latest = v
+      break
+    }
+  }
+
+  const qualifier = latest != null && qualify ? qualify(latest) : null
+
   return (
     <div className="history-tile">
-      <span className="history-tile__label">{label}</span>
+      <div className="history-tile__header">
+        <span className="history-tile__label">{label}</span>
+        {latest != null && (
+          <span className="history-tile__value">
+            {latest.toFixed(decimals)}
+            {unit && <span className="history-tile__unit"> {unit}</span>}
+            {qualifier && <span className="history-tile__qualifier"> · {qualifier}</span>}
+          </span>
+        )}
+      </div>
       <Sparkline values={values} accent={accent} />
     </div>
   )
+}
+
+function qualifyRadiation(w: number): string {
+  if (w < 20) return 'nuit'
+  if (w < 150) return 'très faible'
+  if (w < 350) return 'faible'
+  if (w < 550) return 'moyen'
+  if (w < 750) return 'fort'
+  return 'plein soleil'
+}
+
+function qualifyCloudCover(p: number): string {
+  if (p < 20) return 'ciel clair'
+  if (p < 50) return 'voilé'
+  if (p < 80) return 'nuageux'
+  return 'couvert'
 }

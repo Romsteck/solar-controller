@@ -34,6 +34,8 @@ pub struct StatusResponse {
     eod_lockout: bool,
     eod_at: Option<chrono::DateTime<Utc>>,
     eod_threshold_v: Option<f32>,
+    solar_lockout: bool,
+    solar_failed_attempts_today: u32,
 }
 
 /// Buffer live 5 min × 1 Hz, sérialisé orienté série pour minimiser les bytes.
@@ -83,6 +85,8 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         eod_lockout: inner.auto.eod_lockout,
         eod_at: inner.auto.eod_at,
         eod_threshold_v: inner.auto.eod_threshold_v,
+        solar_lockout: inner.auto.solar_lockout,
+        solar_failed_attempts_today: inner.auto.solar_failed_attempts_today,
     })
 }
 

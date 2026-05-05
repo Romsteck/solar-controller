@@ -280,6 +280,66 @@ body {
   transition: opacity 0.3s ease;
 }
 
+.trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  padding: 0.15rem 0.5rem 0.15rem 0.35rem;
+  border-radius: 0.5rem;
+  background: var(--bg-2);
+  border: 1px solid transparent;
+  letter-spacing: 0.01em;
+}
+
+.trend__gauge {
+  display: block;
+  flex-shrink: 0;
+}
+
+.trend__track {
+  fill: color-mix(in srgb, var(--text-dim) 22%, transparent);
+}
+
+.trend__zero {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 1.5;
+  opacity: 0.55;
+}
+
+.trend__fill {
+  transition: y 0.4s ease, height 0.4s ease, fill 0.2s ease;
+}
+
+.trend__value {
+  white-space: nowrap;
+}
+
+.trend--rising {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 30%, transparent);
+  background: color-mix(in srgb, var(--ok) 10%, var(--bg-2));
+}
+.trend--rising .trend__fill {
+  fill: var(--ok);
+}
+
+.trend--falling {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg-2));
+}
+.trend--falling .trend__fill {
+  fill: var(--danger);
+}
+
+.trend--stable {
+  color: var(--text-muted);
+}
+
 .range-selector {
   display: inline-flex;
   gap: 0.25rem;
@@ -351,13 +411,40 @@ body {
   padding: 0.85rem 1rem;
 }
 
+.history-tile__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
 .history-tile__label {
-  display: block;
   color: var(--text-dim);
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  margin-bottom: 0.35rem;
+}
+
+.history-tile__value {
+  color: var(--text-0);
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+}
+
+.history-tile__unit {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.78rem;
+}
+
+.history-tile__qualifier {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
 }
 
 

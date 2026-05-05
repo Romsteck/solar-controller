@@ -222,3 +222,41 @@ pub async fn fetch_forecast_window(db: &Db) -> Result<Vec<ForecastDay>, sqlx::Er
     }
     Ok(out)
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// weather_samples : dernier relevé météo courant (cloud cover + radiation)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct WeatherSnapshot {
+    pub cloud_cover_pct: Option<f32>,
+    pub shortwave_wm2: Option<f32>,
+}
+
+/// Récupère le dernier `weather_samples` plus récent que `now - max_age`.
+/// Retourne `None` si rien d'assez frais (ex: weather loop down depuis > max_age).
+/// Utilisé par la décision auto pour la garde "météo défavorable".
+pub async fn fetch_latest_weather(
+    db: &Db,
+    max_age: Duration,
+) -> Result<Option<WeatherSnapshot>, sqlx::Error> {
+    let max_age_secs = max_age.as_secs() as i64;
+    let row = sqlx::query(
+        "SELECT cloud_cover_pct, shortwave_wm2
+         FROM weather_samples
+         WHERE ts > now() - make_interval(secs => $1)
+         ORDER BY ts DESC
+         LIMIT 1",
+    )
+    .bind(max_age_secs)
+    .fetch_optional(db.pool())
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(WeatherSnapshot {
+            cloud_cover_pct: r.try_get("cloud_cover_pct")?,
+            shortwave_wm2: r.try_get("shortwave_wm2")?,
+        })),
+    }
+}

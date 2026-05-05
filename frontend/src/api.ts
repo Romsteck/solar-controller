@@ -32,6 +32,8 @@ export interface StatusResponse {
   eod_lockout: boolean
   eod_at: string | null
   eod_threshold_v: number | null
+  solar_lockout: boolean
+  solar_failed_attempts_today: number
 }
 
 export type Range = 'hour' | 'day' | 'week' | 'month'
